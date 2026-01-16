@@ -1,0 +1,25 @@
+[Unit]
+Description=Telegram Client User Bot Service (Multi-Account)
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/path/to/clientTgUserBot
+Environment="PATH=/path/to/clientTgUserBot/client_env/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/path/to/clientTgUserBot/client_env/bin/python /path/to/clientTgUserBot/main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# 日志配置
+SyslogIdentifier=clienttguserbot
+
+# 安全设置（可选）
+# NoNewPrivileges=true
+# PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+

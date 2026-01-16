@@ -1,0 +1,33 @@
+# 配置文件
+config.json
+
+# Session 文件
+*.session
+*.session-journal
+
+# 日志文件
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+client_env/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
