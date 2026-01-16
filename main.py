@@ -63,6 +63,9 @@ config = load_config()
 accounts = config['accounts']
 target_bot_username = config['target_bot_username']
 distribution_strategy = config.get('distribution_strategy', 'round_robin')  # round_robin 或 random
+# 支持 "round" 作为 "round_robin" 的别名
+if distribution_strategy == 'round':
+    distribution_strategy = 'round_robin'
 
 # 消息发送配置（防止风控）
 send_interval = config.get('send_interval', 2.0)  # 发送间隔（秒），默认2秒
@@ -130,8 +133,8 @@ chat_client_usage: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(i
 
 # 已处理消息的去重集合（使用消息的唯一标识）
 # 格式：f"{chat_id}_{sender_id}_{message_date}_{message_text_hash}"
-# 值：消息处理时间（用于定期清理）
-processed_messages: Dict[str, float] = {}
+# 值：{timestamp: float, client_message_ids: Dict[int, int]} - 处理时间和各客户端看到的 message_id
+processed_messages: Dict[str, Dict] = {}
 
 # 消息去重锁（确保多客户端并发时不会重复处理）
 message_dedup_lock = asyncio.Lock()
@@ -147,8 +150,8 @@ async def cleanup_processed_messages():
             
             # 清理30分钟前的记录
             keys_to_remove = [
-                key for key, timestamp in processed_messages.items()
-                if timestamp < cutoff_time
+                key for key, data in processed_messages.items()
+                if data.get('timestamp', 0) < cutoff_time
             ]
             
             for key in keys_to_remove:
@@ -163,13 +166,15 @@ async def cleanup_processed_messages():
 
 # 消息数据结构
 class MessageTask:
-    def __init__(self, chat_id, from_chat_id, message_id, user_type="", client_index=None, received_by_client_index=None):
+    def __init__(self, chat_id, from_chat_id, message_id, user_type="", 
+                 client_index=None, 
+                 client_message_ids=None):
         self.chat_id = chat_id  # 目标群组ID
         self.from_chat_id = from_chat_id  # 源消息所在群组ID
-        self.message_id = message_id  # 源消息ID（这是收到消息的客户端看到的ID）
+        self.message_id = message_id  # 默认使用第一个收到的 message_id
         self.user_type = user_type
         self.client_index = client_index  # 指定使用哪个客户端发送（如果为None，由分配策略决定）
-        self.received_by_client_index = received_by_client_index  # 收到消息的客户端索引（用于复制消息）
+        self.client_message_ids = client_message_ids or {}  # 所有客户端看到的 message_id 映射 {client_index: message_id}
 
 def get_client_for_chat(chat_id: int) -> Client:
     """根据分配策略获取用于发送消息的客户端"""
@@ -223,27 +228,41 @@ async def message_sender():
             task = await message_queue.get()
             logger.info(f"从队列获取到消息，准备复制到群组 {task.chat_id}...")
             
-            # 选择用于发送的客户端
-            # 优先使用收到消息的客户端来复制（因为它能看到正确的 message_id）
+            # 选择用于发送的客户端（根据分配策略）
             # 如果指定了 client_index，则使用指定的客户端
             if task.client_index is not None:
-                send_client = clients[task.client_index]
-                send_client_name = accounts[task.client_index]['name']
+                send_client_index = task.client_index
             else:
+                # 使用分配策略选择客户端
                 send_client = get_client_for_chat(task.chat_id)
-                send_client_name = accounts[clients.index(send_client)]['name']
+                send_client_index = clients.index(send_client)
             
-            # 用于复制消息的客户端（必须使用收到消息的客户端，因为它能看到正确的 message_id）
-            if task.received_by_client_index is not None:
-                copy_client = clients[task.received_by_client_index]
-                copy_client_name = accounts[task.received_by_client_index]['name']
-            else:
-                # 如果没有记录收到消息的客户端，使用发送客户端（降级方案）
+            send_client = clients[send_client_index]
+            send_client_name = accounts[send_client_index]['name']
+            
+            # 获取分配策略选择的客户端看到的 message_id
+            # 如果该客户端看到了消息，使用它的 message_id；否则使用默认的 message_id
+            if send_client_index in task.client_message_ids:
+                copy_message_id = task.client_message_ids[send_client_index]
                 copy_client = send_client
                 copy_client_name = send_client_name
-                logger.warning(f"未记录收到消息的客户端，使用发送客户端 {copy_client_name} 来复制")
+                logger.info(f"分配策略选择客户端 {send_client_name}，使用该客户端看到的 message_id: {copy_message_id}")
+            else:
+                # 如果分配策略选择的客户端没有看到消息，使用第一个看到的客户端
+                if task.client_message_ids:
+                    first_client_index = list(task.client_message_ids.keys())[0]
+                    copy_message_id = task.client_message_ids[first_client_index]
+                    copy_client = clients[first_client_index]
+                    copy_client_name = accounts[first_client_index]['name']
+                    logger.warning(f"分配策略选择客户端 {send_client_name} 未看到消息，使用客户端 {copy_client_name} 的 message_id: {copy_message_id}")
+                else:
+                    # 降级：使用默认的 message_id
+                    copy_message_id = task.message_id
+                    copy_client = send_client
+                    copy_client_name = send_client_name
+                    logger.warning(f"未找到任何客户端的 message_id，使用默认 message_id: {copy_message_id}")
             
-            logger.info(f"使用客户端 {send_client_name} 发送消息到群组 {task.chat_id}（使用客户端 {copy_client_name} 复制消息）")
+            logger.info(f"使用客户端 {send_client_name} 发送消息到群组 {task.chat_id}（使用客户端 {copy_client_name} 复制消息，message_id: {copy_message_id}）")
             
             # 计算延迟时间（基础间隔 + 随机抖动）
             jitter = random.uniform(0, send_jitter)
@@ -254,15 +273,15 @@ async def message_sender():
             await asyncio.sleep(delay)
             
             # 使用客户端模拟操作：copy_message（不带转发标头，模拟用户复制粘贴）
-            # 重要：必须使用收到消息的客户端来复制，因为它能看到正确的 message_id
+            # 使用分配策略选择的客户端对应的 message_id
             try:
                 logger.info(f"开始使用客户端 {copy_client_name} 模拟操作复制消息到群组 {task.chat_id}...")
                 
-                # 使用收到消息的客户端来复制消息（因为它能看到正确的 message_id）
+                # 使用分配策略选择的客户端看到的 message_id 来复制
                 copied_message = await copy_client.copy_message(
                     chat_id=task.chat_id,
                     from_chat_id=task.from_chat_id,
-                    message_id=task.message_id
+                    message_id=copy_message_id
                 )
                 
                 if copied_message:
@@ -272,15 +291,28 @@ async def message_sender():
                 
             except Exception as e:
                 logger.error(f"✗ 客户端 {copy_client_name} 复制消息到群组 {task.chat_id} 时发生错误: {str(e)}", exc_info=True)
-                # 如果 copy_message 失败，尝试降级为 send_message（但这不是客户端模拟操作）
+                # 如果 copy_message 失败，尝试降级方案
                 try:
                     logger.warning(f"尝试降级方案：获取原始消息后重新发送...")
-                    original_message = await copy_client.get_messages(task.from_chat_id, task.message_id)
-                    if original_message and original_message.text:
-                        await send_client.send_message(task.chat_id, original_message.text)
-                        logger.info(f"✓ 已通过客户端 {send_client_name} 降级方案发送消息到群组 {task.chat_id}")
+                    # 尝试从任意一个看到消息的客户端获取消息内容
+                    original_message = None
+                    for client_idx, msg_id in task.client_message_ids.items():
+                        try:
+                            temp_client = clients[client_idx]
+                            original_message = await temp_client.get_messages(task.from_chat_id, msg_id)
+                            if original_message:
+                                break
+                        except:
+                            continue
+                    
+                    if original_message:
+                        if original_message.text or original_message.caption:
+                            await send_client.send_message(task.chat_id, original_message.text or original_message.caption)
+                            logger.info(f"✓ 已通过客户端 {send_client_name} 降级方案发送消息到群组 {task.chat_id}")
+                        else:
+                            logger.error(f"原始消息无文本内容，无法降级发送")
                     else:
-                        logger.error(f"原始消息无文本内容或无法获取，无法降级发送")
+                        logger.error(f"无法从任何客户端获取原始消息")
                 except Exception as e2:
                     logger.error(f"✗ 客户端 {copy_client_name} 降级方案也失败: {str(e2)}", exc_info=True)
             
@@ -384,11 +416,16 @@ def create_message_handler(client_index: int):
                     
                     # 检查是否已处理过
                     if message_key in processed_messages:
-                        logger.info(f"🔄 [{client_name}] 消息已由其他客户端处理，跳过重复处理（消息ID: {message.id}, key: {message_key[:50]}...）")
+                        # 消息已处理过，但记录当前客户端看到的 message_id
+                        processed_messages[message_key]['client_message_ids'][client_index] = message.id
+                        logger.info(f"🔄 [{client_name}] 消息已由其他客户端处理，记录当前客户端的 message_id: {message.id}，跳过重复处理")
                         return
                     
-                    # 标记为已处理（记录当前时间戳）
-                    processed_messages[message_key] = datetime.now().timestamp()
+                    # 标记为已处理，并记录所有客户端看到的 message_id
+                    processed_messages[message_key] = {
+                        'timestamp': datetime.now().timestamp(),
+                        'client_message_ids': {client_index: message.id}  # 记录当前客户端看到的 message_id
+                    }
                     logger.info(f"📝 [{client_name}] 标记消息为已处理（消息ID: {message.id}, key: {message_key[:50]}...）")
                 
                 # 获取消息所在的群组ID
@@ -399,15 +436,17 @@ def create_message_handler(client_index: int):
                 # 获取用户类型信息（用于日志）
                 user_type = "机器人" if sender.is_bot else "普通用户"
                 
+                # 获取所有客户端看到的 message_id 映射（从 processed_messages 中获取）
+                client_message_ids = processed_messages.get(message_key, {}).get('client_message_ids', {client_index: message_id})
+                
                 # 将消息加入队列，而不是直接发送
-                # 重要：记录收到消息的客户端索引，因为不同客户端看到的 message_id 可能不同
-                # 发送时必须使用收到消息的客户端来复制，因为它能看到正确的 message_id
+                # 保存所有客户端看到的 message_id，这样分配策略选择哪个客户端，就用哪个客户端的 message_id
                 task = MessageTask(
                     chat_id=chat_id,
                     from_chat_id=from_chat_id,
-                    message_id=message_id,
+                    message_id=message_id,  # 默认使用第一个收到的 message_id
                     user_type=user_type,
-                    received_by_client_index=client_index  # 记录收到消息的客户端
+                    client_message_ids=client_message_ids  # 所有客户端看到的 message_id 映射
                 )
                 await message_queue.put(task)
                 queue_size = message_queue.qsize()
