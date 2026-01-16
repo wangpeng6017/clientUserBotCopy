@@ -125,6 +125,9 @@ message_queue = asyncio.Queue()
 # 每个群组的客户端轮询索引（用于 round_robin 策略）
 chat_client_index: Dict[int, int] = defaultdict(int)
 
+# 每个群组每个客户端的使用计数（用于 random 策略，确保更均匀的分配）
+chat_client_usage: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+
 # 已处理消息的去重集合（使用消息的唯一标识）
 # 格式：f"{chat_id}_{sender_id}_{message_date}_{message_text_hash}"
 # 值：消息处理时间（用于定期清理）
@@ -177,12 +180,38 @@ def get_client_for_chat(chat_id: int) -> Client:
         # 轮询策略：每个群组按顺序使用不同的客户端
         index = chat_client_index[chat_id] % len(clients)
         chat_client_index[chat_id] += 1
-        return clients[index]
+        selected_client = clients[index]
+        logger.debug(f"轮询分配：群组 {chat_id} 使用客户端 {accounts[index]['name']} (索引: {index})")
+        return selected_client
     elif distribution_strategy == 'random':
-        # 随机策略：随机选择一个客户端
-        return random.choice(clients)
+        # 随机策略：使用加权随机分配，确保更均匀
+        # 优先选择使用次数较少的客户端，但仍然保持随机性
+        usage = chat_client_usage[chat_id]
+        
+        # 计算每个客户端的使用次数
+        usage_counts = [usage.get(i, 0) for i in range(len(clients))]
+        min_usage = min(usage_counts) if usage_counts else 0
+        
+        # 找出使用次数最少的客户端（可能有多个）
+        least_used_indices = [i for i, count in enumerate(usage_counts) if count == min_usage]
+        
+        # 如果有多个使用次数最少的客户端，随机选择一个
+        # 这样可以确保均匀分配，同时保持随机性
+        if len(least_used_indices) > 1:
+            index = random.choice(least_used_indices)
+        else:
+            # 如果只有一个最少使用的，就选它
+            index = least_used_indices[0]
+        
+        # 更新使用计数
+        chat_client_usage[chat_id][index] += 1
+        
+        selected_client = clients[index]
+        logger.debug(f"随机分配（加权）：群组 {chat_id} 使用客户端 {accounts[index]['name']} (索引: {index}, 使用次数: {usage[index]})")
+        return selected_client
     else:
         # 默认使用第一个客户端
+        logger.warning(f"未知的分配策略: {distribution_strategy}，使用第一个客户端")
         return clients[0]
 
 async def message_sender():
