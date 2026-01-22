@@ -5,10 +5,13 @@ import json
 import asyncio
 import random
 from datetime import datetime, timezone
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Union
 from collections import defaultdict
-from pyrogram import Client, filters
-from pyrogram.errors import SessionPasswordNeeded
+from pyrogram import Client
+from pyrogram.errors import SessionPasswordNeeded, FloodWait, RPCError
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+import uvicorn
 
 # 加载配置文件
 def load_config():
@@ -38,10 +41,6 @@ def load_config():
                 print("错误: 配置文件缺少必需的配置项: accounts 或 api_id/api_hash")
                 sys.exit(1)
         
-        if 'target_bot_username' not in config:
-            print("错误: 配置文件缺少必需的配置项: target_bot_username")
-            sys.exit(1)
-        
         # 验证每个账户配置
         for i, account in enumerate(config['accounts']):
             if 'api_id' not in account or 'api_hash' not in account:
@@ -61,7 +60,6 @@ def load_config():
 # 加载配置
 config = load_config()
 accounts = config['accounts']
-target_bot_username = config['target_bot_username']
 distribution_strategy = config.get('distribution_strategy', 'round_robin')  # round_robin 或 random
 # 支持 "round" 作为 "round_robin" 的别名
 if distribution_strategy == 'round':
@@ -70,6 +68,61 @@ if distribution_strategy == 'round':
 # 消息发送配置（防止风控）
 send_interval = config.get('send_interval', 2.0)  # 发送间隔（秒），默认2秒
 send_jitter = config.get('send_jitter', 1.0)  # 抖动时间（秒），默认1秒，会在0到send_jitter之间随机
+
+# 模拟真人操作的配置
+think_time_min = config.get('think_time_min', 0.5)  # 最小思考时间（秒），默认0.5秒，模拟看到消息后的反应时间
+think_time_max = config.get('think_time_max', 3.0)  # 最大思考时间（秒），默认3秒
+operation_delay_min = config.get('operation_delay_min', 0.3)  # 操作前最小延迟（秒），默认0.3秒，模拟点击、选择等操作时间
+operation_delay_max = config.get('operation_delay_max', 1.0)  # 操作前最大延迟（秒），默认1秒
+batch_delay_factor = config.get('batch_delay_factor', 0.5)  # 批量消息延迟因子，队列中每多一条消息，额外延迟（秒），默认0.5秒
+rest_probability = config.get('rest_probability', 0.05)  # 休息概率，每次发送后有5%概率休息，默认0.05（5%）
+rest_time_min = config.get('rest_time_min', 10)  # 最小休息时间（秒），默认10秒
+rest_time_max = config.get('rest_time_max', 60)  # 最大休息时间（秒），默认60秒
+
+# 自动清除未读标记配置
+auto_mark_read = config.get('auto_mark_read', True)  # 是否自动标记消息为已读，默认 True
+mark_read_interval = config.get('mark_read_interval', 300)  # 定期清除未读标记的间隔（秒），默认300秒（5分钟）
+mark_read_on_receive = config.get('mark_read_on_receive', True)  # 收到消息时立即标记为已读，默认 True
+mark_read_delay = config.get('mark_read_delay', 0.5)  # 清除每个群组未读标记的延迟（秒），默认0.5秒，避免触发限流
+
+# 验证配置合理性
+if send_interval < 0:
+    logger.warning(f"send_interval 配置值 {send_interval} 无效，使用默认值 2.0")
+    send_interval = 2.0
+if send_jitter < 0:
+    logger.warning(f"send_jitter 配置值 {send_jitter} 无效，使用默认值 1.0")
+    send_jitter = 1.0
+if mark_read_delay < 0:
+    logger.warning(f"mark_read_delay 配置值 {mark_read_delay} 无效，使用默认值 0.5")
+    mark_read_delay = 0.5
+if mark_read_interval < 0:
+    logger.warning(f"mark_read_interval 配置值 {mark_read_interval} 无效，使用默认值 300")
+    mark_read_interval = 300
+if think_time_min < 0 or think_time_max < think_time_min:
+    logger.warning(f"think_time 配置无效，使用默认值: min=0.5, max=3.0")
+    think_time_min, think_time_max = 0.5, 3.0
+if operation_delay_min < 0 or operation_delay_max < operation_delay_min:
+    logger.warning(f"operation_delay 配置无效，使用默认值: min=0.3, max=1.0")
+    operation_delay_min, operation_delay_max = 0.3, 1.0
+if batch_delay_factor < 0:
+    logger.warning(f"batch_delay_factor 配置值 {batch_delay_factor} 无效，使用默认值 0.5")
+    batch_delay_factor = 0.5
+if rest_probability < 0 or rest_probability > 1:
+    logger.warning(f"rest_probability 配置值 {rest_probability} 无效，使用默认值 0.05")
+    rest_probability = 0.05
+if rest_time_min < 0 or rest_time_max < rest_time_min:
+    logger.warning(f"rest_time 配置无效，使用默认值: min=10, max=60")
+    rest_time_min, rest_time_max = 10, 60
+
+# HTTP API 配置
+enable_http_api = config.get('enable_http_api', True)  # 是否启用HTTP API，默认True
+http_host = config.get('http_host', '0.0.0.0')  # HTTP服务器监听地址，默认0.0.0.0
+http_port = config.get('http_port', 8000)  # HTTP服务器端口，默认8000
+
+# 验证HTTP配置
+if http_port < 1 or http_port > 65535:
+    logger.warning(f"http_port 配置值 {http_port} 无效，使用默认值 8000")
+    http_port = 8000
 
 # 配置日志路径（支持相对路径和绝对路径）
 log_dir_config = config.get('log_dir', 'logs')
@@ -131,50 +184,86 @@ chat_client_index: Dict[int, int] = defaultdict(int)
 # 每个群组每个客户端的使用计数（用于 random 策略，确保更均匀的分配）
 chat_client_usage: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
-# 已处理消息的去重集合（使用消息的唯一标识）
-# 格式：f"{chat_id}_{sender_id}_{message_date}_{message_text_hash}"
-# 值：{timestamp: float, client_message_ids: Dict[int, int]} - 处理时间和各客户端看到的 message_id
-processed_messages: Dict[str, Dict] = {}
-
-# 消息去重锁（确保多客户端并发时不会重复处理）
-message_dedup_lock = asyncio.Lock()
-
-# 清理旧消息记录的任务（每5分钟清理一次，保留最近30分钟的记录）
-async def cleanup_processed_messages():
-    """定期清理已处理消息记录"""
+# 自动标记消息为已读的任务（定期清除所有群组的未读标记）
+async def auto_mark_read_task():
+    """定期清除所有群组的未读消息标记和被回复标记"""
+    if not auto_mark_read:
+        return
+    
     while True:
         try:
-            await asyncio.sleep(300)  # 每5分钟执行一次
-            current_time = datetime.now().timestamp()
-            cutoff_time = current_time - 1800  # 30分钟前
+            await asyncio.sleep(mark_read_interval)
+            logger.info(f"开始定期清除所有群组的未读消息标记...")
             
-            # 清理30分钟前的记录
-            keys_to_remove = [
-                key for key, data in processed_messages.items()
-                if data.get('timestamp', 0) < cutoff_time
-            ]
+            for i, client in enumerate(clients):
+                client_name = accounts[i]['name']
+                try:
+                    # 检查客户端是否连接
+                    if not client.is_connected:
+                        logger.warning(f"[{client_name}] 客户端未连接，跳过清除未读标记")
+                        continue
+                    
+                    # 获取所有对话（包括群组）
+                    processed_chats = set()
+                    chat_count = 0
+                    async for dialog in client.get_dialogs():
+                        chat = dialog.chat
+                        chat_id = chat.id
+                        
+                        # 只处理群组和超级群组，跳过私聊
+                        if chat.type.name not in ['GROUP', 'SUPERGROUP']:
+                            continue
+                        
+                        # 避免重复处理同一个群组
+                        if chat_id in processed_chats:
+                            continue
+                        processed_chats.add(chat_id)
+                        chat_count += 1
+                        
+                        try:
+                            # 检查客户端是否连接
+                            if not client.is_connected:
+                                logger.warning(f"[{client_name}] 客户端未连接，跳过群组 {chat_id}")
+                                continue
+                            
+                            # 标记该群组的所有消息为已读（清除未读标记和被回复标记）
+                            await client.read_chat_history(chat_id)
+                            logger.debug(f"[{client_name}] 已清除群组 {chat_id} 的未读消息标记")
+                            
+                            # 添加延迟，避免触发限流
+                            if mark_read_delay > 0:
+                                await asyncio.sleep(mark_read_delay)
+                        except FloodWait as e:
+                            # 处理限流错误，等待指定时间
+                            wait_time = e.value
+                            logger.warning(f"[{client_name}] 触发限流，等待 {wait_time} 秒后继续...")
+                            await asyncio.sleep(wait_time)
+                            # 重试一次
+                            try:
+                                await client.read_chat_history(chat_id)
+                                logger.debug(f"[{client_name}] 重试后已清除群组 {chat_id} 的未读消息标记")
+                            except Exception as e2:
+                                logger.warning(f"[{client_name}] 重试清除群组 {chat_id} 未读标记时出错: {str(e2)}")
+                        except Exception as e:
+                            logger.warning(f"[{client_name}] 清除群组 {chat_id} 未读标记时出错: {str(e)}")
+                    
+                    logger.info(f"[{client_name}] 完成清除未读标记，共处理 {len(processed_chats)} 个群组（遍历了 {chat_count} 个群组）")
+                except Exception as e:
+                    logger.error(f"[{client_name}] 定期清除未读标记任务出错: {str(e)}", exc_info=True)
             
-            for key in keys_to_remove:
-                del processed_messages[key]
-            
-            if keys_to_remove:
-                logger.info(f"清理了 {len(keys_to_remove)} 条旧的已处理消息记录，当前记录数: {len(processed_messages)}")
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"清理已处理消息记录时出错: {str(e)}", exc_info=True)
+            logger.error(f"定期清除未读标记任务发生错误: {str(e)}", exc_info=True)
+            await asyncio.sleep(60)  # 出错后等待1分钟再继续
 
 # 消息数据结构
 class MessageTask:
-    def __init__(self, chat_id, from_chat_id, message_id, user_type="", 
-                 client_index=None, 
-                 client_message_ids=None):
+    def __init__(self, chat_id, client_index=None, text=None, photo=None):
         self.chat_id = chat_id  # 目标群组ID
-        self.from_chat_id = from_chat_id  # 源消息所在群组ID
-        self.message_id = message_id  # 默认使用第一个收到的 message_id
-        self.user_type = user_type
         self.client_index = client_index  # 指定使用哪个客户端发送（如果为None，由分配策略决定）
-        self.client_message_ids = client_message_ids or {}  # 所有客户端看到的 message_id 映射 {client_index: message_id}
+        self.text = text  # 文本内容（可选）
+        self.photo = photo  # 图片数据（bytes，可选）
 
 def get_client_for_chat(chat_id: int) -> Client:
     """根据分配策略获取用于发送消息的客户端"""
@@ -226,7 +315,6 @@ async def message_sender():
         try:
             # 从队列中获取消息（会阻塞直到有消息）
             task = await message_queue.get()
-            logger.info(f"从队列获取到消息，准备复制到群组 {task.chat_id}...")
             
             # 选择用于发送的客户端（根据分配策略）
             # 如果指定了 client_index，则使用指定的客户端
@@ -240,85 +328,119 @@ async def message_sender():
             send_client = clients[send_client_index]
             send_client_name = accounts[send_client_index]['name']
             
-            # 获取分配策略选择的客户端看到的 message_id
-            # 如果该客户端看到了消息，使用它的 message_id；否则使用默认的 message_id
-            if send_client_index in task.client_message_ids:
-                copy_message_id = task.client_message_ids[send_client_index]
-                copy_client = send_client
-                copy_client_name = send_client_name
-                logger.info(f"分配策略选择客户端 {send_client_name}，使用该客户端看到的 message_id: {copy_message_id}")
-            else:
-                # 如果分配策略选择的客户端没有看到消息，使用第一个看到的客户端
-                if task.client_message_ids:
-                    first_client_index = list(task.client_message_ids.keys())[0]
-                    copy_message_id = task.client_message_ids[first_client_index]
-                    copy_client = clients[first_client_index]
-                    copy_client_name = accounts[first_client_index]['name']
-                    logger.warning(f"分配策略选择客户端 {send_client_name} 未看到消息，使用客户端 {copy_client_name} 的 message_id: {copy_message_id}")
-                else:
-                    # 降级：使用默认的 message_id
-                    copy_message_id = task.message_id
-                    copy_client = send_client
-                    copy_client_name = send_client_name
-                    logger.warning(f"未找到任何客户端的 message_id，使用默认 message_id: {copy_message_id}")
+            # 记录发送信息
+            content_desc = []
+            if task.text:
+                content_desc.append("文本")
+            if task.photo:
+                content_desc.append("图片")
+            logger.info(f"从队列获取到发送任务，准备发送到群组 {task.chat_id}...")
+            logger.info(f"使用客户端 {send_client_name} 发送消息到群组 {task.chat_id}（内容: {', '.join(content_desc) if content_desc else '空'}）")
             
-            logger.info(f"使用客户端 {send_client_name} 发送消息到群组 {task.chat_id}（使用客户端 {copy_client_name} 复制消息，message_id: {copy_message_id}）")
+            # ========== 模拟真人操作流程 ==========
+            # 1. 思考时间：模拟看到消息后的反应时间（使用正态分布，更自然）
+            think_time = max(think_time_min, min(think_time_max, 
+                random.gauss((think_time_min + think_time_max) / 2, (think_time_max - think_time_min) / 4)))
+            logger.debug(f"💭 模拟思考时间: {think_time:.2f} 秒...")
+            await asyncio.sleep(think_time)
             
-            # 计算延迟时间（基础间隔 + 随机抖动）
-            jitter = random.uniform(0, send_jitter)
-            delay = send_interval + jitter
-            logger.info(f"等待 {delay:.2f} 秒后发送（间隔: {send_interval}秒，抖动: {jitter:.2f}秒）...")
+            # 2. 基础发送间隔 + 随机抖动（使用更不规律的分布）
+            # 使用 Beta 分布，让延迟更集中在中间值，但偶尔会有较大波动
+            beta_value = random.betavariate(2, 2)  # Beta(2,2) 分布，集中在中间
+            jitter = send_jitter * beta_value
+            base_delay = send_interval + jitter
+            
+            # 3. 批量消息额外延迟：如果队列中有多条消息，增加延迟（模拟真人不会立即处理所有消息）
+            queue_size = message_queue.qsize()
+            batch_delay = queue_size * batch_delay_factor
+            if queue_size > 0:
+                logger.debug(f"📦 队列中有 {queue_size} 条待处理消息，增加批量延迟: {batch_delay:.2f} 秒")
+            
+            total_delay = base_delay + batch_delay
+            logger.info(f"⏱️  等待 {total_delay:.2f} 秒后发送（基础间隔: {send_interval}秒，抖动: {jitter:.2f}秒，批量延迟: {batch_delay:.2f}秒）...")
             
             # 等待延迟时间
-            await asyncio.sleep(delay)
+            await asyncio.sleep(total_delay)
             
-            # 使用客户端模拟操作：copy_message（不带转发标头，模拟用户复制粘贴）
-            # 使用分配策略选择的客户端对应的 message_id
+            # 4. 操作前延迟：模拟点击、选择等操作时间
+            operation_delay = random.uniform(operation_delay_min, operation_delay_max)
+            logger.debug(f"👆 模拟操作延迟: {operation_delay:.2f} 秒（点击、选择等）...")
+            await asyncio.sleep(operation_delay)
+            
+            # 发送消息
             try:
-                logger.info(f"开始使用客户端 {copy_client_name} 模拟操作复制消息到群组 {task.chat_id}...")
+                # 检查客户端是否连接
+                if not send_client.is_connected:
+                    logger.error(f"客户端 {send_client_name} 未连接，无法发送消息")
+                    raise ConnectionError(f"客户端 {send_client_name} 未连接")
                 
-                # 使用分配策略选择的客户端看到的 message_id 来复制
-                copied_message = await copy_client.copy_message(
-                    chat_id=task.chat_id,
-                    from_chat_id=task.from_chat_id,
-                    message_id=copy_message_id
-                )
+                logger.info(f"开始使用客户端 {send_client_name} 发送消息到群组 {task.chat_id}...")
                 
-                if copied_message:
-                    logger.info(f"✓ 已通过客户端 {copy_client_name} 模拟操作复制{task.user_type}消息到群组 {task.chat_id} (消息ID: {copied_message.id})")
-                else:
-                    logger.warning(f"⚠ 客户端 {copy_client_name} 复制消息返回 None，可能消息为空或无法复制")
-                
-            except Exception as e:
-                logger.error(f"✗ 客户端 {copy_client_name} 复制消息到群组 {task.chat_id} 时发生错误: {str(e)}", exc_info=True)
-                # 如果 copy_message 失败，尝试降级方案
-                try:
-                    logger.warning(f"尝试降级方案：获取原始消息后重新发送...")
-                    # 尝试从任意一个看到消息的客户端获取消息内容
-                    original_message = None
-                    for client_idx, msg_id in task.client_message_ids.items():
-                        try:
-                            temp_client = clients[client_idx]
-                            original_message = await temp_client.get_messages(task.from_chat_id, msg_id)
-                            if original_message:
-                                break
-                        except:
-                            continue
-                    
-                    if original_message:
-                        if original_message.text or original_message.caption:
-                            await send_client.send_message(task.chat_id, original_message.text or original_message.caption)
-                            logger.info(f"✓ 已通过客户端 {send_client_name} 降级方案发送消息到群组 {task.chat_id}")
-                        else:
-                            logger.error(f"原始消息无文本内容，无法降级发送")
+                sent_message = None
+                if task.photo:
+                    # 发送图片（可以带说明文字）
+                    if isinstance(task.photo, bytes):
+                        sent_message = await send_client.send_photo(
+                            chat_id=task.chat_id,
+                            photo=task.photo,
+                            caption=task.text if task.text else None
+                        )
                     else:
-                        logger.error(f"无法从任何客户端获取原始消息")
-                except Exception as e2:
-                    logger.error(f"✗ 客户端 {copy_client_name} 降级方案也失败: {str(e2)}", exc_info=True)
+                        logger.error(f"图片内容格式错误，应为 bytes 类型")
+                        raise ValueError("图片内容格式错误")
+                elif task.text:
+                    # 只发送文本消息
+                    sent_message = await send_client.send_message(
+                        chat_id=task.chat_id,
+                        text=task.text
+                    )
+                else:
+                    logger.error(f"消息内容为空，必须提供文本或图片")
+                    raise ValueError("消息内容为空")
+                
+                if sent_message:
+                    msg_type = "图片" if task.photo else "文本"
+                    logger.info(f"✓ 已通过客户端 {send_client_name} 发送{msg_type}消息到群组 {task.chat_id} (消息ID: {sent_message.id})")
+                else:
+                    logger.warning(f"⚠ 客户端 {send_client_name} 发送消息返回 None")
+            
+            except FloodWait as e:
+                # 处理限流错误
+                wait_time = e.value
+                logger.warning(f"✗ 客户端 {send_client_name} 触发限流，需要等待 {wait_time} 秒")
+                await asyncio.sleep(wait_time)
+                # 重试一次
+                try:
+                    if task.photo:
+                        sent_message = await send_client.send_photo(
+                            chat_id=task.chat_id,
+                            photo=task.photo,
+                            caption=task.text if task.text else None
+                        )
+                    elif task.text:
+                        sent_message = await send_client.send_message(
+                            chat_id=task.chat_id,
+                            text=task.text
+                        )
+                    if sent_message:
+                        logger.info(f"✓ 重试后已通过客户端 {send_client_name} 发送消息到群组 {task.chat_id} (消息ID: {sent_message.id})")
+                except Exception as e_retry:
+                    logger.error(f"✗ 客户端 {send_client_name} 重试发送消息也失败: {str(e_retry)}", exc_info=True)
+                    raise e_retry
+            except Exception as e:
+                logger.error(f"✗ 客户端 {send_client_name} 发送消息到群组 {task.chat_id} 时发生错误: {str(e)}", exc_info=True)
+                raise
             
             # 标记任务完成
             message_queue.task_done()
-            logger.info(f"消息发送完成，当前队列剩余: {message_queue.qsize()} 条")
+            queue_size = message_queue.qsize()
+            logger.info(f"✅ 消息发送完成，当前队列剩余: {queue_size} 条")
+            
+            # 5. 偶尔的休息时间：模拟真人不会一直盯着屏幕（随机休息）
+            if random.random() < rest_probability:
+                rest_time = random.uniform(rest_time_min, rest_time_max)
+                logger.info(f"😴 模拟休息时间: {rest_time:.1f} 秒（随机休息，模拟真人行为）...")
+                await asyncio.sleep(rest_time)
             
         except asyncio.CancelledError:
             logger.info("消息发送任务已取消")
@@ -327,154 +449,135 @@ async def message_sender():
             logger.error(f"消息发送任务发生错误: {str(e)}", exc_info=True)
             await asyncio.sleep(1)  # 出错后等待1秒再继续
 
-def create_message_handler(client_index: int):
-    """为每个客户端创建消息处理器"""
-    client = clients[client_index]
-    client_name = accounts[client_index]['name']
-    
-    @client.on_message(filters.all)
-    async def message_handler(client, message):
-        """处理收到的消息"""
-        global start_time
-        try:
-            # 记录启动时间（首次收到消息时）
-            if start_time is None:
-                from datetime import timezone
-                start_time = datetime.now(timezone.utc)
-                logger.info(f"首次收到消息，启动时间: {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            
-            # 记录所有收到的消息（用于调试）
-            logger.info(f"🔔 [{client_name}] 收到新消息 - 消息ID: {message.id}, 群组ID: {message.chat.id}, 是否群组: {message.chat.type}")
-            
-            # 检查消息时间，只处理启动后的消息
-            message_time = message.date
-            # 确保时间对象都有时区信息，统一转换为 UTC 进行比较
-            if message_time.tzinfo is None:
-                # 如果没有时区信息，假设是 UTC
-                from datetime import timezone
-                message_time = message_time.replace(tzinfo=timezone.utc)
-            
-            if message_time < start_time:
-                # 这是历史消息，忽略
-                logger.info(f"⏮️ [{client_name}] 忽略历史消息 ID {message.id} (消息时间: {message_time}, 启动时间: {start_time})")
-                return
-            
-            logger.info(f"✅ [{client_name}] 消息时间检查通过，继续处理...")
-            
-            # 获取发送者信息
-            sender = message.from_user
-            if sender:
-                sender_info = f"用户名: {sender.username or '无用户名'}, ID: {sender.id}, 是否机器人: {sender.is_bot}"
-                logger.info(f"👤 [{client_name}] 发送者信息 - {sender_info}, 群组: {message.chat.id}, 消息ID: {message.id}")
-            else:
-                logger.warning(f"⚠️ [{client_name}] 无法获取发送者信息，sender 为 None")
-                return
-            
-            # 判断是否为目标用户（可以是机器人或普通用户）
-            logger.info(f"🔍 [{client_name}] 检查用户名匹配 - 目标: '{target_bot_username}', 实际: '{sender.username if sender else None}'")
-            
-            if sender and sender.username == target_bot_username:
-                logger.info(f"✅ [{client_name}] 匹配到目标用户: {sender.username} (ID: {sender.id})")
-                
-                # 使用锁确保去重检查的原子性
-                async with message_dedup_lock:
-                    # 生成消息的唯一标识（用于去重）
-                    # 使用：chat_id + sender_id + message_date（精确到秒，忽略毫秒）+ message_text前200字符的hash
-                    # 注意：不同客户端看到的 message.id 可能不同，所以不能使用 message.id
-                    
-                    # 处理消息日期时间（精确到秒，忽略毫秒和时区差异）
-                    if message.date:
-                        # 转换为 UTC 并只保留到秒
-                        if message.date.tzinfo is None:
-                            msg_date_utc = message.date.replace(tzinfo=timezone.utc)
-                        else:
-                            msg_date_utc = message.date.astimezone(timezone.utc)
-                        # 只保留到秒，忽略微秒
-                        msg_date_utc = msg_date_utc.replace(microsecond=0)
-                        message_date_str = msg_date_utc.strftime('%Y%m%d%H%M%S')
-                    else:
-                        message_date_str = ""
-                    
-                    # 处理消息文本（取前200字符，确保hash稳定）
-                    message_text = (message.text or message.caption or "").strip()
-                    if message_text:
-                        # 只取前200字符，避免文本过长导致hash不稳定
-                        message_text_for_hash = message_text[:200]
-                        message_text_hash = hash(message_text_for_hash)
-                    else:
-                        # 如果没有文本，使用媒体类型作为标识
-                        if message.media:
-                            media_type = str(type(message.media).__name__)
-                            message_text_hash = hash(f"media_{media_type}")
-                        else:
-                            message_text_hash = 0
-                    
-                    message_key = f"{message.chat.id}_{sender.id}_{message_date_str}_{message_text_hash}"
-                    
-                    # 调试日志：输出生成的 key（仅前100个字符，避免日志过长）
-                    logger.debug(f"🔑 [{client_name}] 消息唯一标识: {message_key[:100]}... (消息ID: {message.id})")
-                    
-                    # 检查是否已处理过
-                    if message_key in processed_messages:
-                        # 消息已处理过，但记录当前客户端看到的 message_id
-                        processed_messages[message_key]['client_message_ids'][client_index] = message.id
-                        logger.info(f"🔄 [{client_name}] 消息已由其他客户端处理，记录当前客户端的 message_id: {message.id}，跳过重复处理")
-                        return
-                    
-                    # 标记为已处理，并记录所有客户端看到的 message_id
-                    processed_messages[message_key] = {
-                        'timestamp': datetime.now().timestamp(),
-                        'client_message_ids': {client_index: message.id}  # 记录当前客户端看到的 message_id
-                    }
-                    logger.info(f"📝 [{client_name}] 标记消息为已处理（消息ID: {message.id}, key: {message_key[:50]}...）")
-                
-                # 获取消息所在的群组ID
-                chat_id = message.chat.id
-                from_chat_id = message.chat.id
-                message_id = message.id
-                
-                # 获取用户类型信息（用于日志）
-                user_type = "机器人" if sender.is_bot else "普通用户"
-                
-                # 获取所有客户端看到的 message_id 映射（从 processed_messages 中获取）
-                client_message_ids = processed_messages.get(message_key, {}).get('client_message_ids', {client_index: message_id})
-                
-                # 将消息加入队列，而不是直接发送
-                # 保存所有客户端看到的 message_id，这样分配策略选择哪个客户端，就用哪个客户端的 message_id
-                task = MessageTask(
-                    chat_id=chat_id,
-                    from_chat_id=from_chat_id,
-                    message_id=message_id,  # 默认使用第一个收到的 message_id
-                    user_type=user_type,
-                    client_message_ids=client_message_ids  # 所有客户端看到的 message_id 映射
-                )
-                await message_queue.put(task)
-                queue_size = message_queue.qsize()
-                logger.info(f"[{client_name}] 消息已加入队列（队列长度: {queue_size}），等待通过客户端模拟操作发送...")
-                
-            else:
-                logger.info(f"❌ [{client_name}] 用户名不匹配，跳过处理")
-                
-        except Exception as e:
-            logger.error(f"❌ [{client_name}] 处理消息时发生错误: {str(e)}", exc_info=True)
-    
-    return message_handler
+# 已移除消息监听功能，现在只通过 HTTP API 发送消息
 
 # 启动消息发送任务的辅助函数
 async def start_sender():
     """启动消息发送任务"""
     await message_sender()
 
+# ========== HTTP API 部分 ==========
+# 创建 FastAPI 应用
+app = FastAPI(title="Telegram Client User Bot API", version="1.0.0")
+
+@app.get("/")
+async def root():
+    """API 根路径"""
+    return {
+        "status": "ok",
+        "service": "Telegram Client User Bot API",
+        "version": "1.0.0",
+        "endpoints": {
+            "send": "/api/send",
+            "health": "/api/health"
+        }
+    }
+
+@app.get("/api/health")
+async def health():
+    """健康检查"""
+    connected_clients = sum(1 for client in clients if client.is_connected)
+    return {
+        "status": "ok",
+        "connected_clients": connected_clients,
+        "total_clients": len(clients),
+        "queue_size": message_queue.qsize()
+    }
+
+@app.post("/api/send")
+async def send(
+    chat_id: int = Form(...),
+    text: Optional[str] = Form(None),
+    photo: Optional[UploadFile] = File(None)
+):
+    """发送消息（支持文本和图片，可以同时发送）"""
+    try:
+        # 验证至少提供一种内容
+        if not text and not photo:
+            raise HTTPException(status_code=400, detail="必须提供 text 或 photo 至少一种内容")
+        
+        photo_data = None
+        if photo:
+            # 读取图片数据
+            photo_data = await photo.read()
+            
+            if not photo_data:
+                raise HTTPException(status_code=400, detail="图片文件为空")
+            
+            # 验证是否为图片格式（简单检查）
+            if not photo.content_type or not photo.content_type.startswith('image/'):
+                logger.warning(f"上传的文件可能不是图片: {photo.content_type}")
+        
+        # 创建任务
+        task = MessageTask(
+            chat_id=chat_id,
+            text=text,
+            photo=photo_data
+        )
+        await message_queue.put(task)
+        
+        # 记录日志
+        content_desc = []
+        if text:
+            content_desc.append(f"文本({len(text)}字符)")
+        if photo_data:
+            content_desc.append(f"图片({len(photo_data)}字节)")
+        logger.info(f"📥 HTTP API: 收到发送请求，chat_id={chat_id}, 内容={', '.join(content_desc)}, 队列长度={message_queue.qsize()}")
+        
+        # 返回响应
+        response = {
+            "status": "success",
+            "message": "消息已加入队列",
+            "chat_id": chat_id,
+            "queue_size": message_queue.qsize()
+        }
+        if text:
+            response["has_text"] = True
+        if photo_data:
+            response["has_photo"] = True
+            response["photo_size"] = len(photo_data)
+            if photo:
+                response["photo_filename"] = photo.filename
+        
+        return response
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"处理发送请求时出错: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"服务器内部错误: {str(e)}")
+
+async def start_http_server():
+    """启动HTTP服务器（在后台运行）"""
+    if not enable_http_api:
+        logger.info("HTTP API 未启用，跳过启动")
+        return
+    
+    try:
+        config_uvicorn = uvicorn.Config(
+            app=app,
+            host=http_host,
+            port=http_port,
+            log_level="info",
+            access_log=False  # 禁用访问日志，避免与主日志冲突
+        )
+        server = uvicorn.Server(config_uvicorn)
+        logger.info(f"🌐 HTTP API 服务器启动在 http://{http_host}:{http_port}")
+        logger.info(f"📡 API 端点:")
+        logger.info(f"   - POST /api/send - 发送消息（支持文本和图片，可同时发送）")
+        logger.info(f"   - GET  /api/health - 健康检查")
+        await server.serve()
+    except asyncio.CancelledError:
+        logger.info("HTTP API 服务器已停止")
+        raise
+    except Exception as e:
+        logger.error(f"HTTP API 服务器启动失败: {str(e)}", exc_info=True)
+
 async def main():
     """主函数"""
     try:
         logger.info("正在启动 Telegram 客户端（Pyrogram）...")
         logger.info(f"共配置 {len(accounts)} 个账户，将创建 {len(clients)} 个客户端")
-        
-        # 为每个客户端注册消息处理器
-        for i, client in enumerate(clients):
-            create_message_handler(i)
-            logger.info(f"已为客户端 {accounts[i]['name']} 注册消息处理器")
         
         # 启动所有客户端
         started_clients = []
@@ -500,30 +603,43 @@ async def main():
         logger.info("=" * 60)
         logger.info(f"✓ 所有 {len(started_clients)} 个客户端已启动")
         logger.info(f"发送间隔: {send_interval}秒，抖动时间: 0-{send_jitter}秒")
-        logger.info(f"目标用户名: {target_bot_username}")
         logger.info(f"分配策略: {distribution_strategy}")
-        logger.info("使用客户端模拟操作（copy_message）复制消息")
         logger.info("=" * 60)
-        logger.info("📢 程序已开始监听所有群的指定用户消息...")
-        logger.info("📢 同一个群的消息将按轮询方式分配给不同客户端发送")
+        logger.info("📢 程序已启动，等待 HTTP API 请求...")
+        logger.info("📢 通过 HTTP API 发送的消息将按配置的策略分配给不同客户端")
         logger.info("=" * 60)
         
-        # 在客户端启动后，启动消息发送任务和清理任务
+        # 在客户端启动后，启动消息发送任务和自动标记已读任务
         sender_task = asyncio.create_task(start_sender())
-        cleanup_task = asyncio.create_task(cleanup_processed_messages())
+        mark_read_task = None
+        if auto_mark_read:
+            mark_read_task = asyncio.create_task(auto_mark_read_task())
+            logger.info("自动标记已读任务已启动...")
         logger.info("消息队列发送任务已启动，等待消息...")
-        logger.info("消息去重清理任务已启动...")
+        
+        # 启动HTTP服务器（如果启用）
+        http_task = None
+        if enable_http_api:
+            http_task = asyncio.create_task(start_http_server())
+            logger.info("HTTP API 服务器任务已启动...")
+            # 给HTTP服务器一点时间启动
+            await asyncio.sleep(0.5)
         
         try:
             # 使用 idle() 保持运行（Pyrogram 推荐方式）
+            # 注意：idle() 会阻塞，但HTTP服务器在独立任务中运行，不会冲突
             from pyrogram import idle
             await idle()
         except KeyboardInterrupt:
             logger.info("收到中断信号，正在关闭...")
         finally:
-            # 取消消息发送任务和清理任务
+            # 取消所有任务
             sender_task.cancel()
-            cleanup_task.cancel()
+            if mark_read_task:
+                mark_read_task.cancel()
+            if http_task:
+                http_task.cancel()
+            
             try:
                 await sender_task
             except asyncio.CancelledError:
@@ -531,12 +647,21 @@ async def main():
             except Exception as e:
                 logger.warning(f"取消发送任务时出错: {str(e)}")
             
-            try:
-                await cleanup_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.warning(f"取消清理任务时出错: {str(e)}")
+            if mark_read_task:
+                try:
+                    await mark_read_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"取消自动标记已读任务时出错: {str(e)}")
+            
+            if http_task:
+                try:
+                    await http_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.warning(f"取消HTTP服务器任务时出错: {str(e)}")
             
             # 等待队列中的消息发送完成（最多等待30秒）
             if not message_queue.empty():

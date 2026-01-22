@@ -3,8 +3,9 @@
 ## 前置要求
 
 1. Python 3.9+ 已安装
-2. 虚拟环境已创建并安装了依赖（pyrogram, tgcrypto）
+2. 虚拟环境已创建并安装了依赖（pyrogram, tgcrypto, fastapi, uvicorn, python-multipart）
 3. 已配置好所有账户的 API 信息和登录（首次运行需要交互式登录）
+4. 已配置好 HTTP API 相关设置（如需要）
 
 ## 安装步骤
 

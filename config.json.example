@@ -11,10 +11,24 @@
             "name": "account2"
         }
     ],
-    "target_bot_username": "your_bot_username",
     "log_dir": "logs",
     "send_interval": 2.0,
     "send_jitter": 1.0,
     "log_level": "INFO",
-    "distribution_strategy": "round_robin"
+    "distribution_strategy": "round_robin",
+    "auto_mark_read": true,
+    "mark_read_interval": 300,
+    "mark_read_on_receive": true,
+    "mark_read_delay": 0.5,
+    "think_time_min": 0.5,
+    "think_time_max": 3.0,
+    "operation_delay_min": 0.3,
+    "operation_delay_max": 1.0,
+    "batch_delay_factor": 0.5,
+    "rest_probability": 0.05,
+    "rest_time_min": 10,
+    "rest_time_max": 60,
+    "enable_http_api": true,
+    "http_host": "0.0.0.0",
+    "http_port": 8000
 }
