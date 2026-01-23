@@ -309,19 +309,54 @@ async def auto_mark_read_task():
                                             limit = min(unread_mentions_count + 50, 100)  # 获取足够多的消息
                                             
                                             try:
+                                                # 先尝试调用 ReadMentions，可能需要在获取之前先标记
+                                                try:
+                                                    from pyrogram.raw.functions.messages import ReadMentions
+                                                    await client.invoke(
+                                                        ReadMentions(
+                                                            peer=peer,
+                                                            top_msg_id=latest_message_id if latest_message_id else None
+                                                        )
+                                                    )
+                                                    logger.debug(f"[{client_name}] 已先调用 ReadMentions API")
+                                                    await asyncio.sleep(0.2)  # 等待服务器处理
+                                                except Exception as e_read_first:
+                                                    logger.debug(f"[{client_name}] 先调用 ReadMentions 失败: {str(e_read_first)}")
+                                                
+                                                # 尝试不同的参数组合
+                                                # offset_id: 从最新消息开始（使用 latest_message_id 或 0）
+                                                # 注意：offset_id=0 可能不对，应该使用实际的消息ID
+                                                offset_id_param = latest_message_id if latest_message_id else 0
+                                                
                                                 result = await client.invoke(
                                                     GetUnreadMentions(
                                                         peer=peer,
-                                                        offset_id=offset_id,
+                                                        offset_id=offset_id_param,
                                                         add_offset=0,
                                                         limit=limit,
-                                                        max_id=0,
-                                                        min_id=0,
-                                                        top_msg_id=latest_message_id if latest_message_id else None
+                                                        max_id=0,  # 0 表示不限制最大ID
+                                                        min_id=0,  # 0 表示不限制最小ID
+                                                        top_msg_id=None  # 不使用 top_msg_id，可能干扰结果
                                                     )
                                                 )
                                                 
                                                 logger.debug(f"[{client_name}] GetUnreadMentions API 返回结果类型: {type(result)}")
+                                                
+                                                # 如果返回空列表，尝试从 0 开始
+                                                if hasattr(result, 'messages') and not result.messages and offset_id_param != 0:
+                                                    logger.debug(f"[{client_name}] 从 latest_message_id 开始未找到，尝试从 0 开始...")
+                                                    result = await client.invoke(
+                                                        GetUnreadMentions(
+                                                            peer=peer,
+                                                            offset_id=0,
+                                                            add_offset=0,
+                                                            limit=limit,
+                                                            max_id=0,
+                                                            min_id=0,
+                                                            top_msg_id=None
+                                                        )
+                                                    )
+                                                    logger.debug(f"[{client_name}] 从 0 开始的 GetUnreadMentions 返回结果类型: {type(result)}")
                                                 
                                                 # 解析返回的消息ID
                                                 mentioned_ids = []
