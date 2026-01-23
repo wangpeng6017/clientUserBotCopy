@@ -397,6 +397,21 @@ async def auto_mark_read_task():
                                                         except Exception as e_batch:
                                                             logger.warning(f"[{client_name}] 批量标记消息时出错: {str(e_batch)}")
                                                     
+                                                    # 标记完所有消息后，再次调用 ReadMentions API 确保清除被@标记
+                                                    try:
+                                                        from pyrogram.raw.functions.messages import ReadMentions
+                                                        max_mentioned_id = max(mentioned_ids) if mentioned_ids else latest_message_id
+                                                        await client.invoke(
+                                                            ReadMentions(
+                                                                peer=peer,
+                                                                top_msg_id=max_mentioned_id if max_mentioned_id else None
+                                                            )
+                                                        )
+                                                        logger.debug(f"[{client_name}] 已调用 ReadMentions API 确保清除被@标记（top_msg_id: {max_mentioned_id}）")
+                                                        await asyncio.sleep(0.2)  # 等待服务器处理
+                                                    except Exception as e_read_mentions:
+                                                        logger.debug(f"[{client_name}] 调用 ReadMentions 确保清除时出错: {str(e_read_mentions)}")
+                                                    
                                                     logger.info(f"[{client_name}] ✓ 已通过 GetUnreadMentions API 清除群组 {chat_id} 的 {mentioned_messages_cleared} 条被@标记（共找到 {len(mentioned_ids)} 条未读提及消息）")
                                                 else:
                                                     logger.info(f"[{client_name}] GetUnreadMentions API 未返回任何未读提及消息，使用备用方法")
