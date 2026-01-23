@@ -280,10 +280,11 @@ async def auto_mark_read_task():
                                         
                                         if isinstance(peer, InputPeerChannel):
                                             # 调用 readMentions API 清除被@标记
+                                            # ReadMentions 的参数是 top_msg_id，不是 max_id
                                             await client.invoke(
                                                 ReadMentions(
                                                     peer=peer,
-                                                    max_id=latest_message_id if latest_message_id else 0
+                                                    top_msg_id=latest_message_id if latest_message_id else None
                                                 )
                                             )
                                             logger.info(f"[{client_name}] ✓ 已清除群组 {chat_id} 的被@标记（清除 {unread_mentions_count} 条未读提及）")
@@ -293,24 +294,24 @@ async def auto_mark_read_task():
                                             raise NotImplementedError("普通群组不支持 ReadMentions")
                                             
                                     except NotImplementedError:
-                                        # 普通群组的备用方法：获取被提及的消息并逐个标记
-                                        logger.debug(f"[{client_name}] 尝试备用方法：获取被提及的消息并逐个标记...")
-                                        mentioned_count = 0
+                                        # 普通群组的备用方法：标记所有消息为已读
+                                        logger.debug(f"[{client_name}] 尝试备用方法：标记所有消息为已读...")
                                         try:
-                                            # 获取最近的消息，查找被提及的消息
-                                            async for message in client.get_chat_history(chat_id, limit=200):
-                                                if message and hasattr(message, 'mentioned') and message.mentioned:
-                                                    mentioned_count += 1
-                                                    # 标记该消息为已读
-                                                    try:
-                                                        await client.read_chat_history(chat_id, max_id=message.id)
-                                                    except Exception:
-                                                        pass
+                                            # 获取最新消息ID
+                                            max_mentioned_id = latest_message_id if latest_message_id else 0
+                                            if max_mentioned_id == 0:
+                                                # 如果没有最新消息ID，尝试获取
+                                                async for message in client.get_chat_history(chat_id, limit=1):
+                                                    if message:
+                                                        max_mentioned_id = message.id
+                                                        break
                                             
-                                            if mentioned_count > 0:
-                                                logger.info(f"[{client_name}] ✓ 已通过备用方法清除群组 {chat_id} 的 {mentioned_count} 条被@标记")
+                                            # 标记到最新消息为已读（这应该能清除被@标记）
+                                            if max_mentioned_id > 0:
+                                                await client.read_chat_history(chat_id, max_id=max_mentioned_id)
+                                                logger.info(f"[{client_name}] ✓ 已通过备用方法清除群组 {chat_id} 的被@标记（标记到消息ID: {max_mentioned_id}）")
                                             else:
-                                                logger.debug(f"[{client_name}] 未找到被提及的消息，可能已被清除")
+                                                logger.debug(f"[{client_name}] 未找到消息，可能群组为空")
                                         except Exception as e_get_mentions:
                                             logger.debug(f"[{client_name}] 获取被提及消息时出错: {str(e_get_mentions)}")
                                             
@@ -345,7 +346,7 @@ async def auto_mark_read_task():
                                                             await client.invoke(
                                                                 ReadMentions(
                                                                     peer=peer,
-                                                                    max_id=latest_message_id if latest_message_id else 0
+                                                                    top_msg_id=latest_message_id if latest_message_id else None
                                                                 )
                                                             )
                                                             logger.info(f"[{client_name}] ✓ 已再次清除群组 {chat_id} 的被@标记")
