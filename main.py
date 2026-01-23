@@ -298,6 +298,7 @@ async def auto_mark_read_task():
                                         
                                         # GetUnreadMentions 只支持超级群组（Channel）
                                         if isinstance(peer, InputPeerChannel):
+                                            logger.debug(f"[{client_name}] 群组 {chat_id} 是超级群组，尝试使用 GetUnreadMentions API...")
                                             # 获取未读提及的消息
                                             # offset_id: 从哪条消息开始（0表示从最新开始）
                                             # add_offset: 偏移量
@@ -320,15 +321,30 @@ async def auto_mark_read_task():
                                                     )
                                                 )
                                                 
+                                                logger.debug(f"[{client_name}] GetUnreadMentions API 返回结果类型: {type(result)}")
+                                                
                                                 # 解析返回的消息ID
                                                 mentioned_ids = []
-                                                if hasattr(result, 'messages') and result.messages:
-                                                    for msg in result.messages:
-                                                        if hasattr(msg, 'id'):
-                                                            mentioned_ids.append(msg.id)
+                                                # 检查返回结果的格式
+                                                if hasattr(result, 'messages'):
+                                                    if result.messages:
+                                                        logger.debug(f"[{client_name}] GetUnreadMentions 返回 {len(result.messages)} 条消息")
+                                                        for msg in result.messages:
+                                                            # 消息可能是 Message 对象或 MessageEmpty 对象
+                                                            if hasattr(msg, 'id'):
+                                                                mentioned_ids.append(msg.id)
+                                                            elif hasattr(msg, 'message'):
+                                                                # 可能是 MessageEmpty，尝试获取 message.id
+                                                                if hasattr(msg.message, 'id'):
+                                                                    mentioned_ids.append(msg.message.id)
+                                                    else:
+                                                        logger.info(f"[{client_name}] GetUnreadMentions API 未返回任何未读提及消息（返回空列表）")
+                                                else:
+                                                    logger.warning(f"[{client_name}] GetUnreadMentions API 返回结果没有 messages 属性，结果: {result}")
                                                 
                                                 # 如果有未读提及的消息，逐个标记为已读
                                                 if mentioned_ids:
+                                                    logger.info(f"[{client_name}] 找到 {len(mentioned_ids)} 条未读提及消息，开始逐个标记...")
                                                     # 按消息ID排序，从旧到新
                                                     mentioned_ids.sort()
                                                     
@@ -344,18 +360,19 @@ async def auto_mark_read_task():
                                                             # 添加小延迟，避免触发限流
                                                             await asyncio.sleep(0.1)
                                                         except Exception as e_batch:
-                                                            logger.debug(f"[{client_name}] 批量标记消息时出错: {str(e_batch)}")
+                                                            logger.warning(f"[{client_name}] 批量标记消息时出错: {str(e_batch)}")
                                                     
                                                     logger.info(f"[{client_name}] ✓ 已通过 GetUnreadMentions API 清除群组 {chat_id} 的 {mentioned_messages_cleared} 条被@标记（共找到 {len(mentioned_ids)} 条未读提及消息）")
                                                 else:
-                                                    logger.debug(f"[{client_name}] GetUnreadMentions API 未返回任何未读提及消息")
+                                                    logger.info(f"[{client_name}] GetUnreadMentions API 未返回任何未读提及消息，使用备用方法")
                                                     # 如果没有找到，使用备用方法
                                                     raise NotImplementedError("未找到未读提及消息")
                                             except Exception as e_get:
-                                                logger.debug(f"[{client_name}] GetUnreadMentions API 调用失败: {str(e_get)}")
+                                                logger.warning(f"[{client_name}] GetUnreadMentions API 调用失败: {str(e_get)}")
                                                 raise NotImplementedError("GetUnreadMentions 不可用")
                                         else:
                                             # 普通群组不支持 GetUnreadMentions
+                                            logger.debug(f"[{client_name}] 群组 {chat_id} 是普通群组（peer 类型: {type(peer)}），不支持 GetUnreadMentions，使用备用方法")
                                             raise NotImplementedError("普通群组不支持 GetUnreadMentions")
                                     
                                     except NotImplementedError:
