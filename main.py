@@ -13,6 +13,7 @@ from pyrogram.errors import SessionPasswordNeeded, FloodWait, RPCError
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
 import uvicorn
+import aiohttp
 
 # 加载配置文件
 def load_config():
@@ -527,12 +528,25 @@ async def health():
 
 @app.post("/api/send")
 async def send(
+    request: Request,
     chat_id: Union[int, str] = Form(...),
-    text: Optional[str] = Form(None),
-    photo: Optional[UploadFile] = File(None)
+    text: Optional[str] = Form(None)
 ):
-    """发送消息（支持文本和图片，可以同时发送）"""
+    """发送消息（支持文本和图片，可以同时发送）
+    
+    参数说明:
+    - chat_id: 目标群组的 chat_id（必需）
+    - text: 文本内容（可选）
+    - photo: 图片文件或图片 URL（字符串），可选
+       - 如果传入文件：使用 multipart/form-data 文件上传，参数名为 photo
+       - 如果传入 URL：使用 multipart/form-data 文本字段，参数名为 photo，值为 URL 字符串
+       API 会自动判断是文件还是 URL
+    """
     try:
+        # 从请求中获取 photo 字段（可能是文件或字符串）
+        form = await request.form()
+        photo = form.get("photo")
+        
         # 验证至少提供一种内容
         if not text and not photo:
             raise HTTPException(status_code=400, detail="必须提供 text 或 photo 至少一种内容")
@@ -554,16 +568,60 @@ async def send(
             processed_chat_id = chat_id
         
         photo_data = None
+        photo_source = None
+        photo_filename = None
+        photo_url_value = None
+        
         if photo:
-            # 读取图片数据
-            photo_data = await photo.read()
-            
-            if not photo_data:
-                raise HTTPException(status_code=400, detail="图片文件为空")
-            
-            # 验证是否为图片格式（简单检查）
-            if not photo.content_type or not photo.content_type.startswith('image/'):
-                logger.warning(f"上传的文件可能不是图片: {photo.content_type}")
+            # 判断 photo 是文件上传还是 URL 字符串
+            if isinstance(photo, UploadFile):
+                # 文件上传方式
+                photo_data = await photo.read()
+                photo_source = "文件上传"
+                photo_filename = photo.filename
+                
+                if not photo_data:
+                    raise HTTPException(status_code=400, detail="图片文件为空")
+                
+                # 验证是否为图片格式（简单检查）
+                if not photo.content_type or not photo.content_type.startswith('image/'):
+                    logger.warning(f"上传的文件可能不是图片: {photo.content_type}")
+            elif isinstance(photo, str):
+                # URL 字符串方式
+                photo_url_value = photo
+                photo_source = "URL"
+                
+                # 验证 URL 格式
+                if not (photo_url_value.startswith('http://') or photo_url_value.startswith('https://')):
+                    raise HTTPException(status_code=400, detail="photo URL 必须以 http:// 或 https:// 开头")
+                
+                # 从 URL 下载图片
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(photo_url_value, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                            if response.status != 200:
+                                raise HTTPException(status_code=400, detail=f"下载图片失败，HTTP 状态码: {response.status}")
+                            
+                            photo_data = await response.read()
+                            if not photo_data:
+                                raise HTTPException(status_code=400, detail="从 URL 下载的图片为空")
+                            
+                            # 验证内容类型
+                            content_type = response.headers.get('Content-Type', '')
+                            if content_type and not content_type.startswith('image/'):
+                                logger.warning(f"从 URL 下载的文件可能不是图片: {content_type}")
+                            
+                            # 从 URL 提取文件名
+                            parsed_url = urlparse(photo_url_value)
+                            photo_filename = os.path.basename(parsed_url.path) or 'image.jpg'
+                            
+                            logger.info(f"✓ 成功从 URL 下载图片，大小: {len(photo_data)} 字节")
+                except aiohttp.ClientError as e:
+                    raise HTTPException(status_code=400, detail=f"下载图片失败: {str(e)}")
+                except Exception as e:
+                    raise HTTPException(status_code=400, detail=f"处理图片 URL 时出错: {str(e)}")
+            else:
+                raise HTTPException(status_code=400, detail="photo 参数必须是文件或 URL 字符串")
         
         # 创建任务
         task = MessageTask(
@@ -578,7 +636,7 @@ async def send(
         if text:
             content_desc.append(f"文本({len(text)}字符)")
         if photo_data:
-            content_desc.append(f"图片({len(photo_data)}字节)")
+            content_desc.append(f"图片({len(photo_data)}字节, 来源: {photo_source})")
         logger.info(f"📥 HTTP API: 收到发送请求，chat_id={processed_chat_id}, 内容={', '.join(content_desc)}, 队列长度={message_queue.qsize()}")
         
         # 返回响应
@@ -593,8 +651,12 @@ async def send(
         if photo_data:
             response["has_photo"] = True
             response["photo_size"] = len(photo_data)
-            if photo:
-                response["photo_filename"] = photo.filename
+            response["photo_source"] = photo_source
+            if photo_filename:
+                response["photo_filename"] = photo_filename
+            # 如果是 URL 方式，也返回 URL
+            if photo_source == "URL" and photo_url_value:
+                response["photo_url"] = photo_url_value
         
         return response
     
@@ -618,6 +680,7 @@ async def start_http_server():
         logger.info(f"🌐 HTTP API 服务器启动在 http://{http_host}:{http_port}")
         logger.info(f"📡 API 端点:")
         logger.info(f"   - POST /api/send - 发送消息（支持文本和图片，可同时发送）")
+        logger.info(f"     参数: chat_id (必需), text (可选), photo (可选), photo_url (可选)")
         logger.info(f"   - GET  /api/health - 健康检查")
         await server.serve()
     except asyncio.CancelledError:
