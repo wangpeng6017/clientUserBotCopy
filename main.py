@@ -4,6 +4,7 @@ import os
 import json
 import asyncio
 import random
+import io
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Union
 from collections import defaultdict
@@ -82,7 +83,7 @@ rest_time_max = config.get('rest_time_max', 60)  # 最大休息时间（秒）�
 # 自动清除未读标记配置
 auto_mark_read = config.get('auto_mark_read', True)  # 是否自动标记消息为已读，默认 True
 mark_read_interval = config.get('mark_read_interval', 300)  # 定期清除未读标记的间隔（秒），默认300秒（5分钟）
-mark_read_on_receive = config.get('mark_read_on_receive', True)  # 收到消息时立即标记为已读，默认 True
+# mark_read_on_receive 已废弃（不再监听消息，所以不需要收到消息时立即标记为已读）
 mark_read_delay = config.get('mark_read_delay', 0.5)  # 清除每个群组未读标记的延迟（秒），默认0.5秒，避免触发限流
 
 # 验证配置合理性
@@ -114,9 +115,8 @@ if rest_time_min < 0 or rest_time_max < rest_time_min:
     logger.warning(f"rest_time 配置无效，使用默认值: min=10, max=60")
     rest_time_min, rest_time_max = 10, 60
 
-# HTTP API 配置
-enable_http_api = config.get('enable_http_api', True)  # 是否启用HTTP API，默认True
-http_host = config.get('http_host', '0.0.0.0')  # HTTP服务器监听地址，默认0.0.0.0
+# HTTP API 配置（现在只支持 HTTP API，所以总是启用）
+http_host = '0.0.0.0'  # HTTP服务器监听地址（固定为0.0.0.0，监听所有接口）
 http_port = config.get('http_port', 8000)  # HTTP服务器端口，默认8000
 
 # 验证HTTP配置
@@ -260,7 +260,7 @@ async def auto_mark_read_task():
 # 消息数据结构
 class MessageTask:
     def __init__(self, chat_id, client_index=None, text=None, photo=None):
-        self.chat_id = chat_id  # 目标群组ID
+        self.chat_id = chat_id  # 目标群组ID（可以是整数或字符串，如 @username）
         self.client_index = client_index  # 指定使用哪个客户端发送（如果为None，由分配策略决定）
         self.text = text  # 文本内容（可选）
         self.photo = photo  # 图片数据（bytes，可选）
@@ -376,13 +376,33 @@ async def message_sender():
                 
                 logger.info(f"开始使用客户端 {send_client_name} 发送消息到群组 {task.chat_id}...")
                 
+                # 必须先获取群组信息，这样 Pyrogram 才能解析 chat_id
+                # 如果客户端未加入群组，get_chat 会失败
+                try:
+                    chat = await send_client.get_chat(task.chat_id)
+                    chat_title = chat.title if hasattr(chat, 'title') and chat.title else 'N/A'
+                    logger.info(f"✓ 验证群组 {task.chat_id} 存在，标题: {chat_title}")
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"✗ 无法获取群组 {task.chat_id} 信息: {error_msg}")
+                    logger.error(f"   原因：客户端 {send_client_name} 可能未加入该群组，或 chat_id 不正确")
+                    logger.error(f"   解决方案：")
+                    logger.error(f"     1. 确保客户端 {send_client_name} 已加入群组 {task.chat_id}")
+                    logger.error(f"     2. 如果使用数字 ID，确保格式正确（群组 ID 通常是负数）")
+                    logger.error(f"     3. 可以尝试使用群组用户名（如 @groupname）代替数字 ID")
+                    # 不抛出异常，记录错误后继续处理下一条消息
+                    message_queue.task_done()
+                    continue
+                
                 sent_message = None
                 if task.photo:
                     # 发送图片（可以带说明文字）
                     if isinstance(task.photo, bytes):
+                        # Pyrogram 需要文件对象，将 bytes 转换为 BytesIO
+                        photo_file = io.BytesIO(task.photo)
                         sent_message = await send_client.send_photo(
                             chat_id=task.chat_id,
-                            photo=task.photo,
+                            photo=photo_file,
                             caption=task.text if task.text else None
                         )
                     else:
@@ -412,9 +432,11 @@ async def message_sender():
                 # 重试一次
                 try:
                     if task.photo:
+                        # Pyrogram 需要文件对象，将 bytes 转换为 BytesIO
+                        photo_file = io.BytesIO(task.photo)
                         sent_message = await send_client.send_photo(
                             chat_id=task.chat_id,
-                            photo=task.photo,
+                            photo=photo_file,
                             caption=task.text if task.text else None
                         )
                     elif task.text:
@@ -427,9 +449,28 @@ async def message_sender():
                 except Exception as e_retry:
                     logger.error(f"✗ 客户端 {send_client_name} 重试发送消息也失败: {str(e_retry)}", exc_info=True)
                     raise e_retry
+            except ValueError as e:
+                error_msg = str(e)
+                if "Peer id invalid" in error_msg or "ID not found" in error_msg:
+                    # chat_id 无效或客户端未加入群组
+                    logger.error(f"✗ 客户端 {send_client_name} 无法发送消息到群组 {task.chat_id}: 客户端可能未加入该群组，或 chat_id 格式不正确")
+                    logger.error(f"   提示：请确保客户端 {send_client_name} 已加入群组 {task.chat_id}")
+                    logger.error(f"   提示：如果使用用户名，请使用 @username 格式；如果使用数字 ID，请确保格式正确")
+                    # 不抛出异常，记录错误后继续处理下一条消息
+                else:
+                    logger.error(f"✗ 客户端 {send_client_name} 发送消息到群组 {task.chat_id} 时发生错误: {error_msg}", exc_info=True)
+                    raise
             except Exception as e:
-                logger.error(f"✗ 客户端 {send_client_name} 发送消息到群组 {task.chat_id} 时发生错误: {str(e)}", exc_info=True)
-                raise
+                error_msg = str(e)
+                if "Peer id invalid" in error_msg or "ID not found" in error_msg:
+                    # chat_id 无效或客户端未加入群组
+                    logger.error(f"✗ 客户端 {send_client_name} 无法发送消息到群组 {task.chat_id}: 客户端可能未加入该群组，或 chat_id 格式不正确")
+                    logger.error(f"   提示：请确保客户端 {send_client_name} 已加入群组 {task.chat_id}")
+                    logger.error(f"   提示：如果使用用户名，请使用 @username 格式；如果使用数字 ID，请确保格式正确")
+                    # 不抛出异常，记录错误后继续处理下一条消息
+                else:
+                    logger.error(f"✗ 客户端 {send_client_name} 发送消息到群组 {task.chat_id} 时发生错误: {error_msg}", exc_info=True)
+                    raise
             
             # 标记任务完成
             message_queue.task_done()
@@ -486,7 +527,7 @@ async def health():
 
 @app.post("/api/send")
 async def send(
-    chat_id: int = Form(...),
+    chat_id: Union[int, str] = Form(...),
     text: Optional[str] = Form(None),
     photo: Optional[UploadFile] = File(None)
 ):
@@ -495,6 +536,22 @@ async def send(
         # 验证至少提供一种内容
         if not text and not photo:
             raise HTTPException(status_code=400, detail="必须提供 text 或 photo 至少一种内容")
+        
+        # 处理 chat_id：支持整数或字符串格式
+        processed_chat_id = chat_id
+        if isinstance(chat_id, str):
+            # 如果是 @username 格式，保持原样
+            if chat_id.startswith('@'):
+                processed_chat_id = chat_id
+            else:
+                # 尝试转换为整数
+                try:
+                    processed_chat_id = int(chat_id)
+                except ValueError:
+                    # 如果无法转换，添加 @ 前缀（可能是用户名，不带@）
+                    processed_chat_id = f"@{chat_id}"
+        elif isinstance(chat_id, int):
+            processed_chat_id = chat_id
         
         photo_data = None
         if photo:
@@ -510,7 +567,7 @@ async def send(
         
         # 创建任务
         task = MessageTask(
-            chat_id=chat_id,
+            chat_id=processed_chat_id,
             text=text,
             photo=photo_data
         )
@@ -522,13 +579,13 @@ async def send(
             content_desc.append(f"文本({len(text)}字符)")
         if photo_data:
             content_desc.append(f"图片({len(photo_data)}字节)")
-        logger.info(f"📥 HTTP API: 收到发送请求，chat_id={chat_id}, 内容={', '.join(content_desc)}, 队列长度={message_queue.qsize()}")
+        logger.info(f"📥 HTTP API: 收到发送请求，chat_id={processed_chat_id}, 内容={', '.join(content_desc)}, 队列长度={message_queue.qsize()}")
         
         # 返回响应
         response = {
             "status": "success",
             "message": "消息已加入队列",
-            "chat_id": chat_id,
+            "chat_id": processed_chat_id,
             "queue_size": message_queue.qsize()
         }
         if text:
@@ -549,10 +606,6 @@ async def send(
 
 async def start_http_server():
     """启动HTTP服务器（在后台运行）"""
-    if not enable_http_api:
-        logger.info("HTTP API 未启用，跳过启动")
-        return
-    
     try:
         config_uvicorn = uvicorn.Config(
             app=app,
@@ -617,13 +670,11 @@ async def main():
             logger.info("自动标记已读任务已启动...")
         logger.info("消息队列发送任务已启动，等待消息...")
         
-        # 启动HTTP服务器（如果启用）
-        http_task = None
-        if enable_http_api:
-            http_task = asyncio.create_task(start_http_server())
-            logger.info("HTTP API 服务器任务已启动...")
-            # 给HTTP服务器一点时间启动
-            await asyncio.sleep(0.5)
+        # 启动HTTP服务器
+        http_task = asyncio.create_task(start_http_server())
+        logger.info("HTTP API 服务器任务已启动...")
+        # 给HTTP服务器一点时间启动
+        await asyncio.sleep(0.5)
         
         try:
             # 使用 idle() 保持运行（Pyrogram 推荐方式）
