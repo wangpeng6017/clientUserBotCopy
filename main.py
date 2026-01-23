@@ -433,22 +433,43 @@ async def auto_mark_read_task():
                                                     except Exception as e_browse:
                                                         logger.warning(f"[{client_name}] 模拟浏览群组信息时出错: {str(e_browse)}")
                                                     
-                                                    # 方法2：调用 ReadMentions API 确保清除被@标记
+                                                    # 方法2：多次调用 ReadMentions API 确保清除被@标记
                                                     try:
                                                         from pyrogram.raw.functions.messages import ReadMentions
                                                         max_mentioned_id = max(mentioned_ids) if mentioned_ids else latest_message_id
                                                         
-                                                        # 调用 ReadMentions API
+                                                        # 第一次调用：使用 max_mentioned_id
                                                         await client.invoke(
                                                             ReadMentions(
                                                                 peer=peer,
                                                                 top_msg_id=max_mentioned_id if max_mentioned_id else None
                                                             )
                                                         )
-                                                        logger.debug(f"[{client_name}] 已调用 ReadMentions API 确保清除被@标记（top_msg_id: {max_mentioned_id}）")
-                                                        await asyncio.sleep(0.3)  # 等待服务器处理
+                                                        logger.debug(f"[{client_name}] 已调用 ReadMentions API（第1次，top_msg_id: {max_mentioned_id}）")
+                                                        await asyncio.sleep(0.3)
+                                                        
+                                                        # 第二次调用：使用更大的 top_msg_id
+                                                        if max_mentioned_id:
+                                                            await client.invoke(
+                                                                ReadMentions(
+                                                                    peer=peer,
+                                                                    top_msg_id=max_mentioned_id + 1000
+                                                                )
+                                                            )
+                                                            logger.debug(f"[{client_name}] 已调用 ReadMentions API（第2次，top_msg_id: {max_mentioned_id + 1000}）")
+                                                            await asyncio.sleep(0.3)
+                                                        
+                                                        # 第三次调用：不指定 top_msg_id
+                                                        await client.invoke(
+                                                            ReadMentions(
+                                                                peer=peer,
+                                                                top_msg_id=None
+                                                            )
+                                                        )
+                                                        logger.debug(f"[{client_name}] 已调用 ReadMentions API（第3次，top_msg_id: None）")
+                                                        await asyncio.sleep(0.5)  # 等待服务器处理
                                                     except Exception as e_read_mentions:
-                                                        logger.debug(f"[{client_name}] 调用 ReadMentions 确保清除时出错: {str(e_read_mentions)}")
+                                                        logger.warning(f"[{client_name}] 调用 ReadMentions 确保清除时出错: {str(e_read_mentions)}")
                                                     
                                                     logger.info(f"[{client_name}] ✓ 已通过模拟浏览群组信息和 GetUnreadMentions API 清除群组 {chat_id} 的 {mentioned_messages_cleared} 条被@标记（共找到 {len(mentioned_ids)} 条未读提及消息）")
                                                 else:
@@ -499,7 +520,8 @@ async def auto_mark_read_task():
                             if unread_mentions_count > 0 or unread_count > 0:
                                 try:
                                     # 等待更长时间，让服务器更新状态（特别是被@标记的清除）
-                                    await asyncio.sleep(1.0)  # 增加到1秒，给服务器更多时间处理
+                                    # 模拟浏览和 ReadMentions API 需要更多时间才能生效
+                                    await asyncio.sleep(2.0)  # 增加到2秒，给服务器更多时间处理
                                     
                                     # 重新获取对话信息，验证清除结果
                                     async for dialog_check in client.get_dialogs():
