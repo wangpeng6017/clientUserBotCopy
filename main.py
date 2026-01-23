@@ -10,7 +10,7 @@ from typing import List, Dict, Optional, Union
 from collections import defaultdict
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded, FloodWait, RPCError
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse
 import uvicorn
 import aiohttp
