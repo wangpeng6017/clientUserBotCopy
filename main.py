@@ -574,18 +574,24 @@ async def send(
         
         if photo:
             # 判断 photo 是文件上传还是 URL 字符串
-            if isinstance(photo, UploadFile):
+            # 检查是否有 filename 和 read 方法（文件上传的特征）
+            if hasattr(photo, 'filename') and hasattr(photo, 'read'):
                 # 文件上传方式
-                photo_data = await photo.read()
-                photo_source = "文件上传"
-                photo_filename = photo.filename
-                
-                if not photo_data:
-                    raise HTTPException(status_code=400, detail="图片文件为空")
-                
-                # 验证是否为图片格式（简单检查）
-                if not photo.content_type or not photo.content_type.startswith('image/'):
-                    logger.warning(f"上传的文件可能不是图片: {photo.content_type}")
+                try:
+                    photo_data = await photo.read()
+                    photo_source = "文件上传"
+                    photo_filename = getattr(photo, 'filename', 'image.jpg')
+                    
+                    if not photo_data:
+                        raise HTTPException(status_code=400, detail="图片文件为空")
+                    
+                    # 验证是否为图片格式（简单检查）
+                    content_type = getattr(photo, 'content_type', '')
+                    if content_type and not content_type.startswith('image/'):
+                        logger.warning(f"上传的文件可能不是图片: {content_type}")
+                except Exception as e:
+                    logger.error(f"读取上传文件时出错: {str(e)}", exc_info=True)
+                    raise HTTPException(status_code=400, detail=f"读取上传文件失败: {str(e)}")
             elif isinstance(photo, str):
                 # URL 字符串方式
                 photo_url_value = photo
@@ -621,7 +627,9 @@ async def send(
                 except Exception as e:
                     raise HTTPException(status_code=400, detail=f"处理图片 URL 时出错: {str(e)}")
             else:
-                raise HTTPException(status_code=400, detail="photo 参数必须是文件或 URL 字符串")
+                # 添加调试信息
+                logger.error(f"photo 类型错误: type={type(photo)}, value={photo}")
+                raise HTTPException(status_code=400, detail=f"photo 参数必须是文件或 URL 字符串，当前类型: {type(photo).__name__}")
         
         # 创建任务
         task = MessageTask(
