@@ -8,6 +8,7 @@ import io
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Union
 from collections import defaultdict
+from urllib.parse import urlparse
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded, FloodWait, RPCError
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
