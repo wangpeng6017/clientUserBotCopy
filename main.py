@@ -335,21 +335,32 @@ async def auto_mark_read_task():
                                     # 第一次浏览时，至少浏览最新的10条消息，确保有消息被处理
                                     min_browse_count = 10 if is_first_browse else 0
                                     
+                                    # 如果是增量浏览，需要确保至少浏览1条新消息
+                                    if not is_first_browse:
+                                        min_browse_count = 1
+                                    
+                                    logger.debug(f"[{client_name}] 开始浏览，is_first_browse={is_first_browse}, offset_id={offset_id}, min_browse_count={min_browse_count}, max_browse_id={max_browse_id}")
+                                    
                                     async for message in client.get_chat_history(chat_id, limit=0, offset_id=offset_id):
                                         if message:
-                                            # 如果有上次浏览记录，只处理从上次最小ID开始的消息
+                                            # 如果有上次浏览记录，只处理从上次最小ID开始的消息（增量浏览）
                                             if last_browse_ids and message.id < min_browse_id:
+                                                logger.debug(f"[{client_name}] 跳过消息ID {message.id}（小于上次最小ID {min_browse_id}）")
                                                 continue
                                             
                                             # 如果设置了 max_browse_id 且已经超过，检查是否已经浏览了足够多的消息
                                             if max_browse_id and message.id > max_browse_id:
-                                                # 如果是第一次浏览且还没有浏览足够多的消息，继续浏览
-                                                if is_first_browse and browse_count < min_browse_count:
-                                                    continue
-                                                break
+                                                # 如果还没有浏览足够多的消息，继续浏览（忽略 max_browse_id 限制）
+                                                if browse_count < min_browse_count:
+                                                    logger.debug(f"[{client_name}] 消息ID {message.id} 超过 max_browse_id {max_browse_id}，但还需要浏览 {min_browse_count - browse_count} 条消息，继续浏览")
+                                                    # 不 break，继续处理这条消息
+                                                else:
+                                                    logger.debug(f"[{client_name}] 消息ID {message.id} 超过 max_browse_id {max_browse_id}，已浏览 {browse_count} 条，停止浏览")
+                                                    break
                                             
                                             browse_count += 1
                                             current_browse_ids.append(message.id)
+                                            logger.debug(f"[{client_name}] 浏览消息ID {message.id}（第 {browse_count} 条）")
                                             
                                             # 每浏览10条消息，标记一次为已读（模拟用户查看）
                                             if browse_count % 10 == 0:
@@ -362,10 +373,13 @@ async def auto_mark_read_task():
                                             
                                             # 如果设置了 max_browse_id 且已经到达，检查是否已经浏览了足够多的消息
                                             if max_browse_id and message.id >= max_browse_id:
-                                                # 如果是第一次浏览且还没有浏览足够多的消息，继续浏览（但不会再有消息了）
-                                                if is_first_browse and browse_count < min_browse_count:
-                                                    logger.debug(f"[{client_name}] 已到达最新消息，但首次浏览需要至少 {min_browse_count} 条，当前 {browse_count} 条")
-                                                break
+                                                # 如果还没有浏览足够多的消息，继续浏览（但不会再有消息了，因为已经到达最新）
+                                                if browse_count < min_browse_count:
+                                                    logger.debug(f"[{client_name}] 已到达最新消息ID {max_browse_id}，但还需要浏览 {min_browse_count - browse_count} 条消息")
+                                                    # 继续尝试浏览，虽然可能没有更多消息了
+                                                else:
+                                                    logger.debug(f"[{client_name}] 已到达最新消息ID {max_browse_id}，已浏览 {browse_count} 条，停止浏览")
+                                                    break
                                             
                                             # 限制单次浏览数量，避免一次性浏览过多（最多1000条）
                                             if browse_count >= 1000:
@@ -380,6 +394,7 @@ async def auto_mark_read_task():
                                                 if message:
                                                     browse_count += 1
                                                     current_browse_ids.append(message.id)
+                                                    logger.debug(f"[{client_name}] 备用方案浏览消息ID {message.id}（第 {browse_count} 条）")
                                                     # 每浏览10条消息，标记一次为已读
                                                     if browse_count % 10 == 0:
                                                         try:
@@ -390,6 +405,10 @@ async def auto_mark_read_task():
                                                             pass
                                         except Exception as e_fallback:
                                             logger.warning(f"[{client_name}] 获取最新10条消息失败: {str(e_fallback)}")
+                                    
+                                    # 如果增量浏览时没有浏览到任何消息，记录警告
+                                    if not is_first_browse and browse_count == 0:
+                                        logger.warning(f"[{client_name}] 增量浏览未获取到任何消息（上次保存的ID: {last_browse_ids}, 当前最新ID: {max_browse_id}）")
                                     
                                     # 获取最新的10条消息，用于更新浏览状态
                                     latest_messages = []
