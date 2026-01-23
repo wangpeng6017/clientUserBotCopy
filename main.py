@@ -186,6 +186,10 @@ chat_client_index: Dict[int, int] = defaultdict(int)
 # 每个群组每个客户端的使用计数（用于 random 策略，确保更均匀的分配）
 chat_client_usage: Dict[int, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
 
+# 每个群组每个客户端的上次浏览状态（存储最后10个消息ID）
+# key: (client_index, chat_id), value: List[int] (最后10个消息ID，从新到旧)
+chat_browse_state: Dict[tuple, List[int]] = {}
+
 # 自动标记消息为已读的任务（定期清除所有群组的未读标记）
 async def auto_mark_read_task():
     """定期清除所有群组的未读消息标记和被回复标记"""
@@ -228,20 +232,12 @@ async def auto_mark_read_task():
                                 logger.warning(f"[{client_name}] 客户端未连接，跳过群组 {chat_id}")
                                 continue
                             
-                            # 1. 获取对话信息，检查是否有未读提及和未读消息
-                            unread_mentions_count = 0
+                            # 1. 获取对话信息，仅用于日志记录（不依赖未读提及数）
                             unread_count = 0
                             try:
-                                # 从当前遍历的 dialog 中获取未读提及数和未读数
-                                if hasattr(dialog, 'unread_mentions_count') and dialog.unread_mentions_count:
-                                    unread_mentions_count = dialog.unread_mentions_count
+                                # 从当前遍历的 dialog 中获取未读数（仅用于日志）
                                 if hasattr(dialog, 'unread_count') and dialog.unread_count:
                                     unread_count = dialog.unread_count
-                                
-                                if unread_mentions_count > 0 or unread_count > 0:
-                                    # 注意：unread_mentions_count 可能包含历史累积的未读提及，不一定准确
-                                    # 特别是对于普通群组，这个值可能不准确
-                                    logger.info(f"[{client_name}] 群组 {chat_id} 有 {unread_count} 条未读消息，{unread_mentions_count} 条未读提及（注意：未读提及数可能包含历史累积，不一定准确）")
                             except Exception as e_dialog:
                                 logger.debug(f"[{client_name}] 获取群组 {chat_id} 未读信息时出错: {str(e_dialog)}")
                             
@@ -266,330 +262,132 @@ async def auto_mark_read_task():
                             except Exception as e_read:
                                 logger.warning(f"[{client_name}] 调用 read_chat_history 清除群组 {chat_id} 未读标记时出错: {str(e_read)}")
                             
-                            # 4. 清除被@标记（使用获取被提及消息并逐个标记的方法）
-                            if unread_mentions_count > 0:
-                                try:
-                                    # 方法1：尝试使用 ReadMentions API（仅超级群组）
-                                    cleared_by_api = False
+                            # 4. 直接模拟浏览群组信息来清除被@标记（不依赖 unread_mentions_count）
+                            # 对所有群组统一使用模拟浏览方法，更可靠
+                            try:
+                                max_msg_id = latest_message_id if latest_message_id else 0
+                                if max_msg_id > 0:
+                                    logger.debug(f"[{client_name}] 开始模拟浏览群组 {chat_id} 信息清除被@标记...")
+                                    
+                                    # 1. 获取群组信息（模拟打开群组）
+                                    try:
+                                        chat_info = await client.get_chat(chat_id)
+                                        chat_title = chat_info.title if hasattr(chat_info, 'title') else 'N/A'
+                                        logger.debug(f"[{client_name}] 已获取群组信息: {chat_title}")
+                                        await asyncio.sleep(0.2)  # 模拟用户打开群组的延迟
+                                    except Exception as e_chat:
+                                        logger.debug(f"[{client_name}] 获取群组信息时出错: {str(e_chat)}")
+                                    
+                                    # 2. 模拟浏览消息历史（增量浏览：从上次浏览位置到最新消息）
+                                    browse_key = (i, chat_id)  # (client_index, chat_id)
+                                    last_browse_ids = chat_browse_state.get(browse_key, [])
+                                    
+                                    # 确定浏览范围
+                                    if last_browse_ids:
+                                        # 有上次浏览记录：从上次的最后10个消息ID中的最小ID开始，到最新消息ID结束
+                                        # get_chat_history 的 offset_id 表示从该消息ID之后开始获取（更新的消息）
+                                        # 所以我们需要从 min(last_browse_ids) - 1 开始，或者使用 min(last_browse_ids) 然后过滤
+                                        min_last_id = min(last_browse_ids)
+                                        # 使用 min_last_id - 1 作为 offset_id，这样会获取从 min_last_id 开始的消息
+                                        offset_id = min_last_id - 1 if min_last_id > 1 else 0
+                                        logger.debug(f"[{client_name}] 群组 {chat_id} 增量浏览：从消息ID {min_last_id} 到 {max_msg_id}（上次保存的最后10个消息ID: {last_browse_ids}）")
+                                    else:
+                                        # 第一次浏览：获取最新的10条消息
+                                        offset_id = 0
+                                        logger.debug(f"[{client_name}] 群组 {chat_id} 首次浏览：获取最新10条消息")
+                                    
+                                    browse_count = 0
+                                    last_read_id = 0
+                                    current_browse_ids = []  # 本次浏览的消息ID（用于更新状态）
+                                    min_browse_id = min(last_browse_ids) if last_browse_ids else 0
+                                    
+                                    # 浏览消息：从上次的最小ID到最新消息
+                                    async for message in client.get_chat_history(chat_id, limit=0, offset_id=offset_id):
+                                        if message:
+                                            # 如果已经超过最新消息，停止浏览
+                                            if message.id > max_msg_id:
+                                                break
+                                            
+                                            # 如果有上次浏览记录，只处理从上次最小ID开始的消息
+                                            if last_browse_ids and message.id < min_browse_id:
+                                                continue
+                                            
+                                            browse_count += 1
+                                            current_browse_ids.append(message.id)
+                                            
+                                            # 每浏览10条消息，标记一次为已读（模拟用户查看）
+                                            if browse_count % 10 == 0:
+                                                try:
+                                                    await client.read_chat_history(chat_id, max_id=message.id)
+                                                    last_read_id = message.id
+                                                    await asyncio.sleep(0.1)  # 模拟用户查看消息的延迟
+                                                except Exception:
+                                                    pass
+                                            
+                                            # 限制浏览数量，避免一次性浏览过多
+                                            if browse_count >= 200:
+                                                break
+                                    
+                                    # 获取最新的10条消息，用于更新浏览状态
+                                    latest_messages = []
+                                    async for message in client.get_chat_history(chat_id, limit=10):
+                                        if message:
+                                            latest_messages.append(message.id)
+                                    
+                                    # 更新浏览状态：保存最新的10条消息ID（从新到旧）
+                                    if latest_messages:
+                                        latest_messages.sort(reverse=True)  # 从新到旧排序
+                                        chat_browse_state[browse_key] = latest_messages[:10]
+                                        logger.debug(f"[{client_name}] 已更新浏览状态：保存最新10个消息ID: {chat_browse_state[browse_key]}")
+                                    
+                                    logger.debug(f"[{client_name}] 已模拟浏览 {browse_count} 条消息，最后标记到消息ID: {last_read_id}")
+                                    await asyncio.sleep(0.3)  # 模拟用户浏览完成后的延迟
+                                    
+                                    # 3. 多次调用 read_chat_history，确保清除所有标记（包括被@标记）
+                                    await client.read_chat_history(chat_id, max_id=max_msg_id)
+                                    await asyncio.sleep(0.1)
+                                    await client.read_chat_history(chat_id, max_id=max_msg_id)
+                                    await asyncio.sleep(0.1)
+                                    await client.read_chat_history(chat_id, max_id=max_msg_id + 1000)
+                                    
+                                    # 4. 如果是超级群组，尝试调用 ReadMentions API 作为额外保障
                                     try:
                                         from pyrogram.raw.functions.messages import ReadMentions
                                         from pyrogram.raw.types import InputPeerChannel
                                         
                                         peer = await client.resolve_peer(chat_id)
-                                        
                                         if isinstance(peer, InputPeerChannel):
-                                            # 调用 readMentions API
                                             await client.invoke(
                                                 ReadMentions(
                                                     peer=peer,
-                                                    top_msg_id=latest_message_id if latest_message_id else None
+                                                    top_msg_id=max_msg_id if max_msg_id else None
                                                 )
                                             )
-                                            cleared_by_api = True
-                                            logger.debug(f"[{client_name}] 已调用 ReadMentions API 清除群组 {chat_id} 的被@标记")
-                                    except Exception as e_api:
-                                        logger.debug(f"[{client_name}] ReadMentions API 调用失败或不可用: {str(e_api)}")
+                                            logger.debug(f"[{client_name}] 已调用 ReadMentions API 作为额外保障")
+                                            await asyncio.sleep(0.3)
+                                    except Exception as e_read_mentions:
+                                        logger.debug(f"[{client_name}] 调用 ReadMentions API 时出错（不影响主流程）: {str(e_read_mentions)}")
                                     
-                                    # 方法2：使用 GetUnreadMentions API 获取真正的未读提及消息（最可靠的方法）
-                                    mentioned_messages_cleared = 0
-                                    try:
-                                        from pyrogram.raw.functions.messages import GetUnreadMentions
-                                        from pyrogram.raw.types import InputPeerChannel
-                                        
-                                        peer = await client.resolve_peer(chat_id)
-                                        
-                                        # GetUnreadMentions 只支持超级群组（Channel）
-                                        if isinstance(peer, InputPeerChannel):
-                                            logger.debug(f"[{client_name}] 群组 {chat_id} 是超级群组，尝试使用 GetUnreadMentions API...")
-                                            # 获取未读提及的消息
-                                            # offset_id: 从哪条消息开始（0表示从最新开始）
-                                            # add_offset: 偏移量
-                                            # limit: 获取数量
-                                            # max_id: 最大消息ID
-                                            # min_id: 最小消息ID
-                                            offset_id = 0
-                                            limit = min(unread_mentions_count + 50, 100)  # 获取足够多的消息
-                                            
-                                            try:
-                                                # 先尝试调用 ReadMentions，可能需要在获取之前先标记
-                                                try:
-                                                    from pyrogram.raw.functions.messages import ReadMentions
-                                                    await client.invoke(
-                                                        ReadMentions(
-                                                            peer=peer,
-                                                            top_msg_id=latest_message_id if latest_message_id else None
-                                                        )
-                                                    )
-                                                    logger.debug(f"[{client_name}] 已先调用 ReadMentions API")
-                                                    await asyncio.sleep(0.2)  # 等待服务器处理
-                                                except Exception as e_read_first:
-                                                    logger.debug(f"[{client_name}] 先调用 ReadMentions 失败: {str(e_read_first)}")
-                                                
-                                                # 尝试不同的参数组合
-                                                # offset_id: 从最新消息开始（使用 latest_message_id 或 0）
-                                                # 注意：offset_id=0 可能不对，应该使用实际的消息ID
-                                                offset_id_param = latest_message_id if latest_message_id else 0
-                                                
-                                                result = await client.invoke(
-                                                    GetUnreadMentions(
-                                                        peer=peer,
-                                                        offset_id=offset_id_param,
-                                                        add_offset=0,
-                                                        limit=limit,
-                                                        max_id=0,  # 0 表示不限制最大ID
-                                                        min_id=0,  # 0 表示不限制最小ID
-                                                        top_msg_id=None  # 不使用 top_msg_id，可能干扰结果
-                                                    )
-                                                )
-                                                
-                                                logger.debug(f"[{client_name}] GetUnreadMentions API 返回结果类型: {type(result)}")
-                                                
-                                                # 如果返回空列表，尝试从 0 开始
-                                                if hasattr(result, 'messages') and not result.messages and offset_id_param != 0:
-                                                    logger.debug(f"[{client_name}] 从 latest_message_id 开始未找到，尝试从 0 开始...")
-                                                    result = await client.invoke(
-                                                        GetUnreadMentions(
-                                                            peer=peer,
-                                                            offset_id=0,
-                                                            add_offset=0,
-                                                            limit=limit,
-                                                            max_id=0,
-                                                            min_id=0,
-                                                            top_msg_id=None
-                                                        )
-                                                    )
-                                                    logger.debug(f"[{client_name}] 从 0 开始的 GetUnreadMentions 返回结果类型: {type(result)}")
-                                                
-                                                # 解析返回的消息ID
-                                                mentioned_ids = []
-                                                # 检查返回结果的格式
-                                                if hasattr(result, 'messages'):
-                                                    if result.messages:
-                                                        logger.debug(f"[{client_name}] GetUnreadMentions 返回 {len(result.messages)} 条消息")
-                                                        for msg in result.messages:
-                                                            # 消息可能是 Message 对象或 MessageEmpty 对象
-                                                            if hasattr(msg, 'id'):
-                                                                mentioned_ids.append(msg.id)
-                                                            elif hasattr(msg, 'message'):
-                                                                # 可能是 MessageEmpty，尝试获取 message.id
-                                                                if hasattr(msg.message, 'id'):
-                                                                    mentioned_ids.append(msg.message.id)
-                                                    else:
-                                                        logger.info(f"[{client_name}] GetUnreadMentions API 未返回任何未读提及消息（返回空列表）")
-                                                else:
-                                                    logger.warning(f"[{client_name}] GetUnreadMentions API 返回结果没有 messages 属性，结果: {result}")
-                                                
-                                                # 如果有未读提及的消息，模拟浏览群组信息来清除被@标记
-                                                if mentioned_ids:
-                                                    logger.info(f"[{client_name}] 找到 {len(mentioned_ids)} 条未读提及消息，开始模拟浏览群组信息清除被@标记...")
-                                                    
-                                                    # 方法1：模拟打开群组并浏览消息历史（模拟用户行为）
-                                                    try:
-                                                        # 1. 获取群组信息（模拟打开群组）
-                                                        chat_info = await client.get_chat(chat_id)
-                                                        logger.debug(f"[{client_name}] 已获取群组信息: {chat_info.title if hasattr(chat_info, 'title') else 'N/A'}")
-                                                        await asyncio.sleep(0.2)  # 模拟用户打开群组的延迟
-                                                        
-                                                        # 2. 浏览消息历史（模拟用户滚动查看消息）
-                                                        # 从最新消息开始，逐步浏览到包含被@消息的位置
-                                                        max_mentioned_id = max(mentioned_ids) if mentioned_ids else latest_message_id
-                                                        min_mentioned_id = min(mentioned_ids) if mentioned_ids else 0
-                                                        
-                                                        # 模拟浏览：从最新消息开始，逐步向下浏览
-                                                        browse_limit = 50  # 每次浏览50条消息
-                                                        browse_count = 0
-                                                        async for message in client.get_chat_history(chat_id, limit=browse_limit):
-                                                            if message and message.id >= min_mentioned_id:
-                                                                browse_count += 1
-                                                                # 每浏览10条消息，标记一次为已读（模拟用户查看）
-                                                                if browse_count % 10 == 0:
-                                                                    try:
-                                                                        await client.read_chat_history(chat_id, max_id=message.id)
-                                                                        await asyncio.sleep(0.1)  # 模拟用户查看消息的延迟
-                                                                    except Exception:
-                                                                        pass
-                                                        
-                                                        logger.debug(f"[{client_name}] 已模拟浏览 {browse_count} 条消息")
-                                                        await asyncio.sleep(0.3)  # 模拟用户浏览完成后的延迟
-                                                        
-                                                        # 3. 标记所有被提及的消息为已读
-                                                        mentioned_ids.sort()
-                                                        batch_size = 10
-                                                        for i in range(0, len(mentioned_ids), batch_size):
-                                                            batch = mentioned_ids[i:i + batch_size]
-                                                            max_batch_id = max(batch)
-                                                            try:
-                                                                await client.read_chat_history(chat_id, max_id=max_batch_id)
-                                                                mentioned_messages_cleared += len(batch)
-                                                                await asyncio.sleep(0.1)
-                                                            except Exception as e_batch:
-                                                                logger.warning(f"[{client_name}] 批量标记消息时出错: {str(e_batch)}")
-                                                        
-                                                        # 4. 再次浏览到最新消息，确保清除所有标记
-                                                        async for message in client.get_chat_history(chat_id, limit=1):
-                                                            if message:
-                                                                await client.read_chat_history(chat_id, max_id=message.id)
-                                                                await asyncio.sleep(0.2)
-                                                        
-                                                        logger.debug(f"[{client_name}] 已模拟浏览群组信息并标记消息为已读")
-                                                    except Exception as e_browse:
-                                                        logger.warning(f"[{client_name}] 模拟浏览群组信息时出错: {str(e_browse)}")
-                                                    
-                                                    # 方法2：多次调用 ReadMentions API 确保清除被@标记
-                                                    try:
-                                                        from pyrogram.raw.functions.messages import ReadMentions
-                                                        max_mentioned_id = max(mentioned_ids) if mentioned_ids else latest_message_id
-                                                        
-                                                        # 第一次调用：使用 max_mentioned_id
-                                                        await client.invoke(
-                                                            ReadMentions(
-                                                                peer=peer,
-                                                                top_msg_id=max_mentioned_id if max_mentioned_id else None
-                                                            )
-                                                        )
-                                                        logger.debug(f"[{client_name}] 已调用 ReadMentions API（第1次，top_msg_id: {max_mentioned_id}）")
-                                                        await asyncio.sleep(0.3)
-                                                        
-                                                        # 第二次调用：使用更大的 top_msg_id
-                                                        if max_mentioned_id:
-                                                            await client.invoke(
-                                                                ReadMentions(
-                                                                    peer=peer,
-                                                                    top_msg_id=max_mentioned_id + 1000
-                                                                )
-                                                            )
-                                                            logger.debug(f"[{client_name}] 已调用 ReadMentions API（第2次，top_msg_id: {max_mentioned_id + 1000}）")
-                                                            await asyncio.sleep(0.3)
-                                                        
-                                                        # 第三次调用：不指定 top_msg_id
-                                                        await client.invoke(
-                                                            ReadMentions(
-                                                                peer=peer,
-                                                                top_msg_id=None
-                                                            )
-                                                        )
-                                                        logger.debug(f"[{client_name}] 已调用 ReadMentions API（第3次，top_msg_id: None）")
-                                                        await asyncio.sleep(0.5)  # 等待服务器处理
-                                                    except Exception as e_read_mentions:
-                                                        logger.warning(f"[{client_name}] 调用 ReadMentions 确保清除时出错: {str(e_read_mentions)}")
-                                                    
-                                                    logger.info(f"[{client_name}] ✓ 已通过模拟浏览群组信息和 GetUnreadMentions API 清除群组 {chat_id} 的 {mentioned_messages_cleared} 条被@标记（共找到 {len(mentioned_ids)} 条未读提及消息）")
-                                                else:
-                                                    logger.info(f"[{client_name}] GetUnreadMentions API 未返回任何未读提及消息，使用备用方法")
-                                                    # 如果没有找到，使用备用方法
-                                                    raise NotImplementedError("未找到未读提及消息")
-                                            except Exception as e_get:
-                                                logger.warning(f"[{client_name}] GetUnreadMentions API 调用失败: {str(e_get)}")
-                                                raise NotImplementedError("GetUnreadMentions 不可用")
-                                        else:
-                                            # 普通群组不支持 GetUnreadMentions
-                                            logger.debug(f"[{client_name}] 群组 {chat_id} 是普通群组（peer 类型: {type(peer)}），不支持 GetUnreadMentions，使用备用方法")
-                                            raise NotImplementedError("普通群组不支持 GetUnreadMentions")
-                                    
-                                    except NotImplementedError:
-                                        # 备用方法：模拟浏览群组信息来清除被@标记（适用于普通群组）
-                                        try:
-                                            max_msg_id = latest_message_id if latest_message_id else 0
-                                            if max_msg_id > 0:
-                                                logger.debug(f"[{client_name}] 群组 {chat_id} 是普通群组，使用模拟浏览方法清除被@标记...")
-                                                
-                                                # 1. 获取群组信息（模拟打开群组）
-                                                try:
-                                                    chat_info = await client.get_chat(chat_id)
-                                                    logger.debug(f"[{client_name}] 已获取群组信息: {chat_info.title if hasattr(chat_info, 'title') else 'N/A'}")
-                                                    await asyncio.sleep(0.2)  # 模拟用户打开群组的延迟
-                                                except Exception as e_chat:
-                                                    logger.debug(f"[{client_name}] 获取群组信息时出错: {str(e_chat)}")
-                                                
-                                                # 2. 模拟浏览消息历史（从最新消息开始，逐步向下浏览）
-                                                # 注意：unread_mentions_count 可能不准确，所以浏览更多消息以确保清除
-                                                # 对于普通群组，浏览最近 100-200 条消息应该足够
-                                                browse_limit = 200  # 固定浏览200条消息，不依赖可能不准确的 unread_mentions_count
-                                                browse_count = 0
-                                                last_read_id = 0
-                                                
-                                                async for message in client.get_chat_history(chat_id, limit=browse_limit):
-                                                    if message:
-                                                        browse_count += 1
-                                                        # 每浏览10条消息，标记一次为已读（模拟用户查看）
-                                                        if browse_count % 10 == 0:
-                                                            try:
-                                                                await client.read_chat_history(chat_id, max_id=message.id)
-                                                                last_read_id = message.id
-                                                                await asyncio.sleep(0.1)  # 模拟用户查看消息的延迟
-                                                            except Exception:
-                                                                pass
-                                                
-                                                logger.debug(f"[{client_name}] 已模拟浏览 {browse_count} 条消息，最后标记到消息ID: {last_read_id}")
-                                                await asyncio.sleep(0.3)  # 模拟用户浏览完成后的延迟
-                                                
-                                                # 3. 多次调用 read_chat_history，确保清除所有标记
-                                                await client.read_chat_history(chat_id, max_id=max_msg_id)
-                                                await asyncio.sleep(0.1)
-                                                await client.read_chat_history(chat_id, max_id=max_msg_id)
-                                                await asyncio.sleep(0.1)
-                                                await client.read_chat_history(chat_id, max_id=max_msg_id + 1000)
-                                                
-                                                logger.info(f"[{client_name}] ✓ 已通过模拟浏览群组信息清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}，浏览了 {browse_count} 条消息）")
-                                            else:
-                                                logger.debug(f"[{client_name}] 未找到最新消息ID")
-                                        except Exception as e_fallback:
-                                            logger.warning(f"[{client_name}] 模拟浏览群组信息时出错: {str(e_fallback)}")
-                                    
-                                    except Exception as e_mentions:
-                                        logger.warning(f"[{client_name}] 获取并标记被提及消息时出错: {str(e_mentions)}")
-                                        # 如果获取被提及消息失败，使用备用方法
-                                        try:
-                                            max_msg_id = latest_message_id if latest_message_id else 0
-                                            if max_msg_id > 0:
-                                                await client.read_chat_history(chat_id, max_id=max_msg_id)
-                                                logger.info(f"[{client_name}] ✓ 已通过备用方法清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}）")
-                                        except Exception as e_fallback:
-                                            logger.debug(f"[{client_name}] 备用方法也失败: {str(e_fallback)}")
-                                        
-                                except Exception as e_mentions:
-                                    logger.warning(f"[{client_name}] 清除群组 {chat_id} 被@标记时出错: {str(e_mentions)}")
-                                    # 如果所有方法都失败，记录警告但不中断流程
-                            
-                            # 5. 验证清除结果：再次检查未读提及数和未读数，确认是否清除成功
-                            if unread_mentions_count > 0 or unread_count > 0:
+                                    logger.info(f"[{client_name}] ✓ 已通过模拟浏览群组信息清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}，浏览了 {browse_count} 条消息）")
+                                else:
+                                    logger.debug(f"[{client_name}] 未找到最新消息ID，跳过清除被@标记")
+                            except Exception as e_mentions:
+                                logger.warning(f"[{client_name}] 模拟浏览群组 {chat_id} 信息清除被@标记时出错: {str(e_mentions)}")
+                                # 如果模拟浏览失败，尝试简单的标记方法
                                 try:
-                                    # 等待更长时间，让服务器更新状态（特别是被@标记的清除）
-                                    # 模拟浏览和 ReadMentions API 需要更多时间才能生效
-                                    await asyncio.sleep(2.0)  # 增加到2秒，给服务器更多时间处理
-                                    
-                                    # 重新获取对话信息，验证清除结果
-                                    async for dialog_check in client.get_dialogs():
-                                        if dialog_check.chat.id == chat_id:
-                                            remaining_mentions = getattr(dialog_check, 'unread_mentions_count', 0) or 0
-                                            remaining_unread = getattr(dialog_check, 'unread_count', 0) or 0
-                                            
-                                            if remaining_mentions > 0 or remaining_unread > 0:
-                                                logger.warning(f"[{client_name}] ⚠ 群组 {chat_id} 清除后仍有 {remaining_unread} 条未读，{remaining_mentions} 条未读提及")
-                                                # 如果仍有未读提及，再次尝试使用 readMentions（使用安全方式）
-                                                if remaining_mentions > 0:
-                                                    try:
-                                                        from pyrogram.raw.functions.messages import ReadMentions
-                                                        from pyrogram.raw.types import InputPeerChannel
-                                                        
-                                                        # 使用 resolve_peer 安全获取 peer
-                                                        peer = await client.resolve_peer(chat_id)
-                                                        
-                                                        if isinstance(peer, InputPeerChannel):
-                                                            await client.invoke(
-                                                                ReadMentions(
-                                                                    peer=peer,
-                                                                    top_msg_id=latest_message_id if latest_message_id else None
-                                                                )
-                                                            )
-                                                            logger.info(f"[{client_name}] ✓ 已再次清除群组 {chat_id} 的被@标记")
-                                                        else:
-                                                            logger.debug(f"[{client_name}] 群组 {chat_id} 是普通群组，无法使用 ReadMentions 重试")
-                                                    except Exception as e_retry:
-                                                        logger.debug(f"[{client_name}] 重试清除被@标记时出错: {str(e_retry)}")
-                                            else:
-                                                logger.info(f"[{client_name}] ✓ 群组 {chat_id} 的未读标记和被@标记已成功清除")
-                                            break
+                                    max_msg_id = latest_message_id if latest_message_id else 0
+                                    if max_msg_id > 0:
+                                        await client.read_chat_history(chat_id, max_id=max_msg_id)
+                                        logger.debug(f"[{client_name}] 已通过简单方法清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}）")
+                                except Exception as e_fallback:
+                                    logger.debug(f"[{client_name}] 备用方法也失败: {str(e_fallback)}")
+                            
+                            # 5. 验证清除结果：等待服务器处理（不检查 unread_mentions_count，因为它可能不准确）
+                            if unread_count > 0:
+                                try:
+                                    # 等待服务器更新状态（模拟浏览和 ReadMentions API 需要时间才能生效）
+                                    await asyncio.sleep(1.0)  # 等待1秒，给服务器时间处理
+                                    logger.debug(f"[{client_name}] 已等待服务器处理群组 {chat_id} 的清除操作")
                                 except Exception as e_verify:
                                     logger.debug(f"[{client_name}] 验证群组 {chat_id} 清除结果时出错: {str(e_verify)}")
                             
