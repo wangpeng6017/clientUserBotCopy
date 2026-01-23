@@ -228,15 +228,20 @@ async def auto_mark_read_task():
                                 logger.warning(f"[{client_name}] 客户端未连接，跳过群组 {chat_id}")
                                 continue
                             
-                            # 1. 获取对话信息，检查是否有未读提及
+                            # 1. 获取对话信息，检查是否有未读提及和未读消息
                             unread_mentions_count = 0
+                            unread_count = 0
                             try:
-                                # 从当前遍历的 dialog 中获取未读提及数
+                                # 从当前遍历的 dialog 中获取未读提及数和未读数
                                 if hasattr(dialog, 'unread_mentions_count') and dialog.unread_mentions_count:
                                     unread_mentions_count = dialog.unread_mentions_count
-                                    logger.debug(f"[{client_name}] 群组 {chat_id} 有 {unread_mentions_count} 条未读提及")
+                                if hasattr(dialog, 'unread_count') and dialog.unread_count:
+                                    unread_count = dialog.unread_count
+                                
+                                if unread_mentions_count > 0 or unread_count > 0:
+                                    logger.info(f"[{client_name}] 群组 {chat_id} 有 {unread_count} 条未读消息，{unread_mentions_count} 条未读提及")
                             except Exception as e_dialog:
-                                logger.debug(f"[{client_name}] 获取群组 {chat_id} 未读提及数时出错: {str(e_dialog)}")
+                                logger.debug(f"[{client_name}] 获取群组 {chat_id} 未读信息时出错: {str(e_dialog)}")
                             
                             # 2. 获取最新消息ID，用于标记所有消息为已读（包括被回复/被提及的消息）
                             latest_message_id = None
@@ -246,36 +251,53 @@ async def auto_mark_read_task():
                                         latest_message_id = message.id
                                         break
                             except Exception as e_msg:
-                                logger.debug(f"[{client_name}] 获取群组 {chat_id} 最新消息时出错: {str(e_msg)}")
+                                logger.warning(f"[{client_name}] 获取群组 {chat_id} 最新消息时出错: {str(e_msg)}")
                             
                             # 3. 标记该群组的所有消息为已读（清除未读标记和被@标记）
                             # 使用 max_id 参数确保标记到最新消息，这样可以清除所有未读标记和被提及标记
-                            if latest_message_id:
-                                await client.read_chat_history(chat_id, max_id=latest_message_id)
-                                if unread_mentions_count > 0:
-                                    logger.debug(f"[{client_name}] 已清除群组 {chat_id} 的未读消息标记和被@标记（标记到消息ID: {latest_message_id}，清除 {unread_mentions_count} 条未读提及）")
+                            try:
+                                if latest_message_id:
+                                    await client.read_chat_history(chat_id, max_id=latest_message_id)
+                                    if unread_mentions_count > 0 or unread_count > 0:
+                                        logger.info(f"[{client_name}] ✓ 已清除群组 {chat_id} 的未读消息标记和被@标记（标记到消息ID: {latest_message_id}，清除 {unread_count} 条未读，{unread_mentions_count} 条未读提及）")
+                                    else:
+                                        logger.debug(f"[{client_name}] 已清除群组 {chat_id} 的未读消息标记（标记到消息ID: {latest_message_id}）")
                                 else:
-                                    logger.debug(f"[{client_name}] 已清除群组 {chat_id} 的未读消息标记（标记到消息ID: {latest_message_id}）")
-                            else:
-                                # 如果没有获取到最新消息ID，使用默认方式
-                                await client.read_chat_history(chat_id)
-                                if unread_mentions_count > 0:
-                                    logger.debug(f"[{client_name}] 已清除群组 {chat_id} 的未读消息标记和被@标记（清除 {unread_mentions_count} 条未读提及）")
-                                else:
-                                    logger.debug(f"[{client_name}] 已清除群组 {chat_id} 的未读消息标记")
+                                    # 如果没有获取到最新消息ID，使用默认方式
+                                    await client.read_chat_history(chat_id)
+                                    if unread_mentions_count > 0 or unread_count > 0:
+                                        logger.info(f"[{client_name}] ✓ 已清除群组 {chat_id} 的未读消息标记和被@标记（清除 {unread_count} 条未读，{unread_mentions_count} 条未读提及）")
+                                    else:
+                                        logger.debug(f"[{client_name}] 已清除群组 {chat_id} 的未读消息标记")
+                            except Exception as e_read:
+                                logger.warning(f"[{client_name}] 调用 read_chat_history 清除群组 {chat_id} 标记时出错: {str(e_read)}")
+                                raise
                             
-                            # 4. 额外处理：如果检测到有未读提及，尝试获取被提及的消息并单独标记
-                            # 注意：Pyrogram 的 read_chat_history 应该已经清除了提及标记，这里作为额外保障
+                            # 4. 验证清除结果：再次检查未读提及数，确认是否清除成功
                             if unread_mentions_count > 0:
                                 try:
-                                    # 再次调用 read_chat_history 确保清除所有提及标记
-                                    if latest_message_id:
-                                        await client.read_chat_history(chat_id, max_id=latest_message_id)
-                                    else:
-                                        await client.read_chat_history(chat_id)
-                                    logger.debug(f"[{client_name}] 已额外清除群组 {chat_id} 的被@标记（确保清除 {unread_mentions_count} 条未读提及）")
-                                except Exception as e_mention:
-                                    logger.debug(f"[{client_name}] 额外清除群组 {chat_id} 的被@标记时出错: {str(e_mention)}")
+                                    # 等待一小段时间，让服务器更新状态
+                                    await asyncio.sleep(0.2)
+                                    
+                                    # 重新获取对话信息，验证清除结果
+                                    async for dialog_check in client.get_dialogs():
+                                        if dialog_check.chat.id == chat_id:
+                                            remaining_mentions = getattr(dialog_check, 'unread_mentions_count', 0) or 0
+                                            remaining_unread = getattr(dialog_check, 'unread_count', 0) or 0
+                                            
+                                            if remaining_mentions > 0 or remaining_unread > 0:
+                                                logger.warning(f"[{client_name}] ⚠ 群组 {chat_id} 清除后仍有 {remaining_unread} 条未读，{remaining_mentions} 条未读提及，尝试再次清除...")
+                                                # 再次尝试清除
+                                                if latest_message_id:
+                                                    await client.read_chat_history(chat_id, max_id=latest_message_id)
+                                                else:
+                                                    await client.read_chat_history(chat_id)
+                                                logger.info(f"[{client_name}] ✓ 已再次清除群组 {chat_id} 的标记")
+                                            else:
+                                                logger.info(f"[{client_name}] ✓ 群组 {chat_id} 的未读标记和被@标记已成功清除")
+                                            break
+                                except Exception as e_verify:
+                                    logger.debug(f"[{client_name}] 验证群组 {chat_id} 清除结果时出错: {str(e_verify)}")
                             
                             # 添加延迟，避免触发限流
                             if mark_read_delay > 0:
