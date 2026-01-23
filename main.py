@@ -311,52 +311,44 @@ async def auto_mark_read_task():
                                     if last_browse_ids:
                                         # 有上次浏览记录：从上次的最后10个消息ID中的最小ID开始，到最新消息ID结束
                                         min_last_id = min(last_browse_ids)
-                                        # 使用 min_last_id - 1 作为 offset_id，这样会获取从 min_last_id 开始的消息
-                                        offset_id = min_last_id - 1 if min_last_id > 1 else 0
+                                        max_last_id = max(last_browse_ids)
                                         logger.debug(f"[{client_name}] 群组 {chat_id} 增量浏览：从消息ID {min_last_id} 到 {max_msg_id}（上次保存的最后10个消息ID: {last_browse_ids}）")
                                     else:
                                         # 第一次浏览：获取最新的消息
-                                        offset_id = 0
+                                        min_last_id = 0
+                                        max_last_id = 0
                                         logger.debug(f"[{client_name}] 群组 {chat_id} 首次浏览：获取最新消息")
                                     
                                     browse_count = 0
                                     last_read_id = 0
                                     current_browse_ids = []  # 本次浏览的消息ID（用于更新状态）
-                                    min_browse_id = min(last_browse_ids) if last_browse_ids else 0
                                     
                                     # 浏览消息：从上次的最小ID到最新消息（如果 max_msg_id 存在）
-                                    # 注意：如果 max_msg_id 为 None 或看起来不正确，继续浏览直到没有更多消息
                                     max_browse_id = max_msg_id if max_msg_id and max_msg_id > 0 else None
                                     if max_browse_id:
-                                        logger.debug(f"[{client_name}] 浏览范围：从消息ID {min_browse_id if last_browse_ids else '最新'} 到 {max_browse_id}")
+                                        logger.debug(f"[{client_name}] 浏览范围：从消息ID {min_last_id if last_browse_ids else '最新'} 到 {max_browse_id}")
                                     else:
-                                        logger.debug(f"[{client_name}] 浏览范围：从消息ID {min_browse_id if last_browse_ids else '最新'} 到最新消息（无限制）")
+                                        logger.debug(f"[{client_name}] 浏览范围：从消息ID {min_last_id if last_browse_ids else '最新'} 到最新消息（无限制）")
                                     
                                     # 第一次浏览时，至少浏览最新的10条消息，确保有消息被处理
-                                    min_browse_count = 10 if is_first_browse else 0
+                                    min_browse_count = 10 if is_first_browse else 1
                                     
-                                    # 如果是增量浏览，需要确保至少浏览1条新消息
-                                    if not is_first_browse:
-                                        min_browse_count = 1
+                                    logger.debug(f"[{client_name}] 开始浏览，is_first_browse={is_first_browse}, min_last_id={min_last_id}, min_browse_count={min_browse_count}, max_browse_id={max_browse_id}")
                                     
-                                    logger.debug(f"[{client_name}] 开始浏览，is_first_browse={is_first_browse}, offset_id={offset_id}, min_browse_count={min_browse_count}, max_browse_id={max_browse_id}")
-                                    
-                                    async for message in client.get_chat_history(chat_id, limit=0, offset_id=offset_id):
+                                    # 增量浏览：从最新消息开始，获取从 min_last_id 到 max_browse_id 之间的消息
+                                    # 使用 offset_id=0 从最新消息开始，然后过滤
+                                    async for message in client.get_chat_history(chat_id, limit=0, offset_id=0):
                                         if message:
                                             # 如果有上次浏览记录，只处理从上次最小ID开始的消息（增量浏览）
-                                            if last_browse_ids and message.id < min_browse_id:
-                                                logger.debug(f"[{client_name}] 跳过消息ID {message.id}（小于上次最小ID {min_browse_id}）")
-                                                continue
+                                            if last_browse_ids and message.id <= min_last_id:
+                                                # 已经到达上次浏览的最小ID，停止浏览
+                                                logger.debug(f"[{client_name}] 已到达上次最小ID {min_last_id}，停止浏览")
+                                                break
                                             
-                                            # 如果设置了 max_browse_id 且已经超过，检查是否已经浏览了足够多的消息
+                                            # 如果设置了 max_browse_id 且已经超过，停止浏览
                                             if max_browse_id and message.id > max_browse_id:
-                                                # 如果还没有浏览足够多的消息，继续浏览（忽略 max_browse_id 限制）
-                                                if browse_count < min_browse_count:
-                                                    logger.debug(f"[{client_name}] 消息ID {message.id} 超过 max_browse_id {max_browse_id}，但还需要浏览 {min_browse_count - browse_count} 条消息，继续浏览")
-                                                    # 不 break，继续处理这条消息
-                                                else:
-                                                    logger.debug(f"[{client_name}] 消息ID {message.id} 超过 max_browse_id {max_browse_id}，已浏览 {browse_count} 条，停止浏览")
-                                                    break
+                                                logger.debug(f"[{client_name}] 消息ID {message.id} 超过 max_browse_id {max_browse_id}，停止浏览")
+                                                break
                                             
                                             browse_count += 1
                                             current_browse_ids.append(message.id)
