@@ -244,10 +244,33 @@ async def auto_mark_read_task():
                             # 2. 获取最新消息ID，用于标记所有消息为已读（包括被回复/被提及的消息）
                             latest_message_id = None
                             try:
-                                async for message in client.get_chat_history(chat_id, limit=1):
-                                    if message:
-                                        latest_message_id = message.id
-                                        break
+                                # 方法1：从对话中获取最新消息ID（最可靠）
+                                try:
+                                    async for dialog in client.get_dialogs():
+                                        if dialog.chat.id == chat_id:
+                                            if hasattr(dialog, 'top_message') and dialog.top_message:
+                                                latest_message_id = dialog.top_message.id
+                                                logger.debug(f"[{client_name}] 从对话中获取群组 {chat_id} 最新消息ID: {latest_message_id}")
+                                                break
+                                except Exception as e_dialog:
+                                    logger.debug(f"[{client_name}] 从对话获取最新消息ID失败: {str(e_dialog)}")
+                                
+                                # 方法2：如果方法1失败，尝试从消息历史获取
+                                if latest_message_id is None:
+                                    try:
+                                        async for message in client.get_chat_history(chat_id, limit=1):
+                                            if message:
+                                                latest_message_id = message.id
+                                                logger.debug(f"[{client_name}] 从消息历史获取群组 {chat_id} 最新消息ID: {latest_message_id}")
+                                                break
+                                    except Exception as e_history:
+                                        logger.debug(f"[{client_name}] 从消息历史获取最新消息ID失败: {str(e_history)}")
+                                
+                                # 如果仍然获取失败，记录警告
+                                if latest_message_id is None:
+                                    logger.warning(f"[{client_name}] 无法获取群组 {chat_id} 的最新消息ID，将使用增量浏览方式")
+                                else:
+                                    logger.debug(f"[{client_name}] 群组 {chat_id} 最新消息ID: {latest_message_id}")
                             except Exception as e_msg:
                                 logger.warning(f"[{client_name}] 获取群组 {chat_id} 最新消息时出错: {str(e_msg)}")
                             
@@ -301,16 +324,23 @@ async def auto_mark_read_task():
                                     current_browse_ids = []  # 本次浏览的消息ID（用于更新状态）
                                     min_browse_id = min(last_browse_ids) if last_browse_ids else 0
                                     
-                                    # 浏览消息：从上次的最小ID到最新消息
+                                    # 浏览消息：从上次的最小ID到最新消息（如果 max_msg_id 存在）
+                                    # 注意：如果 max_msg_id 为 None 或看起来不正确，继续浏览直到没有更多消息
+                                    max_browse_id = max_msg_id if max_msg_id and max_msg_id > 0 else None
+                                    if max_browse_id:
+                                        logger.debug(f"[{client_name}] 浏览范围：从消息ID {min_browse_id if last_browse_ids else '最新'} 到 {max_browse_id}")
+                                    else:
+                                        logger.debug(f"[{client_name}] 浏览范围：从消息ID {min_browse_id if last_browse_ids else '最新'} 到最新消息（无限制）")
+                                    
                                     async for message in client.get_chat_history(chat_id, limit=0, offset_id=offset_id):
                                         if message:
-                                            # 如果已经超过最新消息，停止浏览
-                                            if message.id > max_msg_id:
-                                                break
-                                            
                                             # 如果有上次浏览记录，只处理从上次最小ID开始的消息
                                             if last_browse_ids and message.id < min_browse_id:
                                                 continue
+                                            
+                                            # 如果设置了 max_browse_id 且已经超过，停止浏览
+                                            if max_browse_id and message.id > max_browse_id:
+                                                break
                                             
                                             browse_count += 1
                                             current_browse_ids.append(message.id)
@@ -324,8 +354,13 @@ async def auto_mark_read_task():
                                                 except Exception:
                                                     pass
                                             
-                                            # 限制浏览数量，避免一次性浏览过多
-                                            if browse_count >= 200:
+                                            # 如果设置了 max_browse_id 且已经到达，停止浏览
+                                            if max_browse_id and message.id >= max_browse_id:
+                                                break
+                                            
+                                            # 限制单次浏览数量，避免一次性浏览过多（最多1000条）
+                                            if browse_count >= 1000:
+                                                logger.debug(f"[{client_name}] 已达到单次浏览上限（1000条），停止浏览")
                                                 break
                                     
                                     # 获取最新的10条消息，用于更新浏览状态
@@ -368,7 +403,7 @@ async def auto_mark_read_task():
                                     except Exception as e_read_mentions:
                                         logger.debug(f"[{client_name}] 调用 ReadMentions API 时出错（不影响主流程）: {str(e_read_mentions)}")
                                     
-                                    logger.info(f"[{client_name}] ✓ 已通过模拟浏览群组信息清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}，浏览了 {browse_count} 条消息）")
+                                    logger.info(f"[{client_name}] ✓ 已通过模拟浏览群组信息清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}，浏览了 {browse_count} 条消息，最新消息ID: {latest_message_id}）")
                                 else:
                                     logger.debug(f"[{client_name}] 未找到最新消息ID，跳过清除被@标记")
                             except Exception as e_mentions:
