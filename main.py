@@ -306,18 +306,18 @@ async def auto_mark_read_task():
                                     last_browse_ids = chat_browse_state.get(browse_key, [])
                                     
                                     # 确定浏览范围
+                                    is_first_browse = len(last_browse_ids) == 0
+                                    
                                     if last_browse_ids:
                                         # 有上次浏览记录：从上次的最后10个消息ID中的最小ID开始，到最新消息ID结束
-                                        # get_chat_history 的 offset_id 表示从该消息ID之后开始获取（更新的消息）
-                                        # 所以我们需要从 min(last_browse_ids) - 1 开始，或者使用 min(last_browse_ids) 然后过滤
                                         min_last_id = min(last_browse_ids)
                                         # 使用 min_last_id - 1 作为 offset_id，这样会获取从 min_last_id 开始的消息
                                         offset_id = min_last_id - 1 if min_last_id > 1 else 0
                                         logger.debug(f"[{client_name}] 群组 {chat_id} 增量浏览：从消息ID {min_last_id} 到 {max_msg_id}（上次保存的最后10个消息ID: {last_browse_ids}）")
                                     else:
-                                        # 第一次浏览：获取最新的10条消息
+                                        # 第一次浏览：获取最新的消息
                                         offset_id = 0
-                                        logger.debug(f"[{client_name}] 群组 {chat_id} 首次浏览：获取最新10条消息")
+                                        logger.debug(f"[{client_name}] 群组 {chat_id} 首次浏览：获取最新消息")
                                     
                                     browse_count = 0
                                     last_read_id = 0
@@ -332,14 +332,20 @@ async def auto_mark_read_task():
                                     else:
                                         logger.debug(f"[{client_name}] 浏览范围：从消息ID {min_browse_id if last_browse_ids else '最新'} 到最新消息（无限制）")
                                     
+                                    # 第一次浏览时，至少浏览最新的10条消息，确保有消息被处理
+                                    min_browse_count = 10 if is_first_browse else 0
+                                    
                                     async for message in client.get_chat_history(chat_id, limit=0, offset_id=offset_id):
                                         if message:
                                             # 如果有上次浏览记录，只处理从上次最小ID开始的消息
                                             if last_browse_ids and message.id < min_browse_id:
                                                 continue
                                             
-                                            # 如果设置了 max_browse_id 且已经超过，停止浏览
+                                            # 如果设置了 max_browse_id 且已经超过，检查是否已经浏览了足够多的消息
                                             if max_browse_id and message.id > max_browse_id:
+                                                # 如果是第一次浏览且还没有浏览足够多的消息，继续浏览
+                                                if is_first_browse and browse_count < min_browse_count:
+                                                    continue
                                                 break
                                             
                                             browse_count += 1
@@ -354,14 +360,36 @@ async def auto_mark_read_task():
                                                 except Exception:
                                                     pass
                                             
-                                            # 如果设置了 max_browse_id 且已经到达，停止浏览
+                                            # 如果设置了 max_browse_id 且已经到达，检查是否已经浏览了足够多的消息
                                             if max_browse_id and message.id >= max_browse_id:
+                                                # 如果是第一次浏览且还没有浏览足够多的消息，继续浏览（但不会再有消息了）
+                                                if is_first_browse and browse_count < min_browse_count:
+                                                    logger.debug(f"[{client_name}] 已到达最新消息，但首次浏览需要至少 {min_browse_count} 条，当前 {browse_count} 条")
                                                 break
                                             
                                             # 限制单次浏览数量，避免一次性浏览过多（最多1000条）
                                             if browse_count >= 1000:
                                                 logger.debug(f"[{client_name}] 已达到单次浏览上限（1000条），停止浏览")
                                                 break
+                                    
+                                    # 如果第一次浏览时没有浏览到任何消息，尝试直接获取最新10条
+                                    if is_first_browse and browse_count == 0:
+                                        logger.debug(f"[{client_name}] 首次浏览未获取到消息，尝试直接获取最新10条消息")
+                                        try:
+                                            async for message in client.get_chat_history(chat_id, limit=10):
+                                                if message:
+                                                    browse_count += 1
+                                                    current_browse_ids.append(message.id)
+                                                    # 每浏览10条消息，标记一次为已读
+                                                    if browse_count % 10 == 0:
+                                                        try:
+                                                            await client.read_chat_history(chat_id, max_id=message.id)
+                                                            last_read_id = message.id
+                                                            await asyncio.sleep(0.1)
+                                                        except Exception:
+                                                            pass
+                                        except Exception as e_fallback:
+                                            logger.warning(f"[{client_name}] 获取最新10条消息失败: {str(e_fallback)}")
                                     
                                     # 获取最新的10条消息，用于更新浏览状态
                                     latest_messages = []
