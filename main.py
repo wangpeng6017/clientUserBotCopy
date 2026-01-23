@@ -288,75 +288,92 @@ async def auto_mark_read_task():
                                     except Exception as e_api:
                                         logger.debug(f"[{client_name}] ReadMentions API 调用失败或不可用: {str(e_api)}")
                                     
-                                    # 方法2：获取被提及的消息并逐个标记为已读（最可靠的方法）
-                                    # 这是模拟用户点击@标记查看被提及消息的行为
+                                    # 方法2：使用 GetUnreadMentions API 获取真正的未读提及消息（最可靠的方法）
                                     mentioned_messages_cleared = 0
                                     try:
-                                        # 获取所有被提及的消息
-                                        # 注意：Pyrogram 的 get_chat_history 没有直接过滤被提及消息的方法
-                                        # 我们需要遍历消息并检查是否被提及
-                                        max_mentioned_id = 0
-                                        mentioned_ids = []
+                                        from pyrogram.raw.functions.messages import GetUnreadMentions
+                                        from pyrogram.raw.types import InputPeerChannel
                                         
-                                        # 获取最近的消息，查找被提及的消息
-                                        # 由于被提及的消息可能很多，我们需要获取足够多的消息
-                                        limit = min(unread_mentions_count * 2, 1000)  # 获取足够多的消息
+                                        peer = await client.resolve_peer(chat_id)
                                         
-                                        async for message in client.get_chat_history(chat_id, limit=limit):
-                                            if message:
-                                                # 检查消息是否提及了当前用户
-                                                # Pyrogram 的 message 对象可能没有直接的 mentioned 属性
-                                                # 但我们可以通过 message.entities 或 message.mentioned 检查
-                                                is_mentioned = False
-                                                
-                                                # 方法1：检查 message.mentioned 属性（如果存在）
-                                                if hasattr(message, 'mentioned') and message.mentioned:
-                                                    is_mentioned = True
-                                                
-                                                # 方法2：检查消息实体中是否有提及
-                                                if hasattr(message, 'entities') and message.entities:
-                                                    for entity in message.entities:
-                                                        # 检查是否是提及实体
-                                                        if hasattr(entity, 'type') and entity.type.name == 'MENTION':
-                                                            is_mentioned = True
-                                                            break
-                                                
-                                                # 如果找到被提及的消息，记录其ID
-                                                if is_mentioned:
-                                                    mentioned_ids.append(message.id)
-                                                    if message.id > max_mentioned_id:
-                                                        max_mentioned_id = message.id
-                                        
-                                        # 如果有被提及的消息，逐个标记为已读
-                                        if mentioned_ids:
-                                            # 按消息ID排序，从旧到新
-                                            mentioned_ids.sort()
+                                        # GetUnreadMentions 只支持超级群组（Channel）
+                                        if isinstance(peer, InputPeerChannel):
+                                            # 获取未读提及的消息
+                                            # offset_id: 从哪条消息开始（0表示从最新开始）
+                                            # add_offset: 偏移量
+                                            # limit: 获取数量
+                                            # max_id: 最大消息ID
+                                            # min_id: 最小消息ID
+                                            offset_id = 0
+                                            limit = min(unread_mentions_count + 50, 100)  # 获取足够多的消息
                                             
-                                            # 批量标记：每10条消息标记一次，避免过于频繁
-                                            batch_size = 10
-                                            for i in range(0, len(mentioned_ids), batch_size):
-                                                batch = mentioned_ids[i:i + batch_size]
-                                                # 标记这批消息中最大的ID为已读
-                                                max_batch_id = max(batch)
-                                                try:
-                                                    await client.read_chat_history(chat_id, max_id=max_batch_id)
-                                                    mentioned_messages_cleared += len(batch)
-                                                    # 添加小延迟，避免触发限流
-                                                    await asyncio.sleep(0.1)
-                                                except Exception as e_batch:
-                                                    logger.debug(f"[{client_name}] 批量标记消息时出错: {str(e_batch)}")
-                                            
-                                            logger.info(f"[{client_name}] ✓ 已通过逐个标记清除群组 {chat_id} 的 {mentioned_messages_cleared} 条被@标记（共找到 {len(mentioned_ids)} 条被提及消息）")
-                                        elif max_mentioned_id > 0:
-                                            # 如果没有找到被提及的消息，但找到了最新消息，标记到最新消息
-                                            await client.read_chat_history(chat_id, max_id=max_mentioned_id)
-                                            logger.info(f"[{client_name}] ✓ 已通过标记到最新消息清除群组 {chat_id} 的被@标记（标记到消息ID: {max_mentioned_id}）")
+                                            try:
+                                                result = await client.invoke(
+                                                    GetUnreadMentions(
+                                                        peer=peer,
+                                                        offset_id=offset_id,
+                                                        add_offset=0,
+                                                        limit=limit,
+                                                        max_id=0,
+                                                        min_id=0,
+                                                        top_msg_id=latest_message_id if latest_message_id else None
+                                                    )
+                                                )
+                                                
+                                                # 解析返回的消息ID
+                                                mentioned_ids = []
+                                                if hasattr(result, 'messages') and result.messages:
+                                                    for msg in result.messages:
+                                                        if hasattr(msg, 'id'):
+                                                            mentioned_ids.append(msg.id)
+                                                
+                                                # 如果有未读提及的消息，逐个标记为已读
+                                                if mentioned_ids:
+                                                    # 按消息ID排序，从旧到新
+                                                    mentioned_ids.sort()
+                                                    
+                                                    # 批量标记：每10条消息标记一次，避免过于频繁
+                                                    batch_size = 10
+                                                    for i in range(0, len(mentioned_ids), batch_size):
+                                                        batch = mentioned_ids[i:i + batch_size]
+                                                        # 标记这批消息中最大的ID为已读
+                                                        max_batch_id = max(batch)
+                                                        try:
+                                                            await client.read_chat_history(chat_id, max_id=max_batch_id)
+                                                            mentioned_messages_cleared += len(batch)
+                                                            # 添加小延迟，避免触发限流
+                                                            await asyncio.sleep(0.1)
+                                                        except Exception as e_batch:
+                                                            logger.debug(f"[{client_name}] 批量标记消息时出错: {str(e_batch)}")
+                                                    
+                                                    logger.info(f"[{client_name}] ✓ 已通过 GetUnreadMentions API 清除群组 {chat_id} 的 {mentioned_messages_cleared} 条被@标记（共找到 {len(mentioned_ids)} 条未读提及消息）")
+                                                else:
+                                                    logger.debug(f"[{client_name}] GetUnreadMentions API 未返回任何未读提及消息")
+                                                    # 如果没有找到，使用备用方法
+                                                    raise NotImplementedError("未找到未读提及消息")
+                                            except Exception as e_get:
+                                                logger.debug(f"[{client_name}] GetUnreadMentions API 调用失败: {str(e_get)}")
+                                                raise NotImplementedError("GetUnreadMentions 不可用")
                                         else:
-                                            # 如果都没有找到，使用备用方法：标记到最新消息
+                                            # 普通群组不支持 GetUnreadMentions
+                                            raise NotImplementedError("普通群组不支持 GetUnreadMentions")
+                                    
+                                    except NotImplementedError:
+                                        # 备用方法：标记到最新消息为已读
+                                        try:
                                             max_msg_id = latest_message_id if latest_message_id else 0
                                             if max_msg_id > 0:
+                                                # 多次调用，确保清除
                                                 await client.read_chat_history(chat_id, max_id=max_msg_id)
+                                                await asyncio.sleep(0.1)
+                                                await client.read_chat_history(chat_id, max_id=max_msg_id)
+                                                await asyncio.sleep(0.1)
+                                                await client.read_chat_history(chat_id, max_id=max_msg_id + 1000)
                                                 logger.info(f"[{client_name}] ✓ 已通过备用方法清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}）")
+                                            else:
+                                                logger.debug(f"[{client_name}] 未找到最新消息ID")
+                                        except Exception as e_fallback:
+                                            logger.debug(f"[{client_name}] 备用方法也失败: {str(e_fallback)}")
                                     
                                     except Exception as e_mentions:
                                         logger.warning(f"[{client_name}] 获取并标记被提及消息时出错: {str(e_mentions)}")
