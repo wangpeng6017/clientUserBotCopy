@@ -274,23 +274,51 @@ async def auto_mark_read_task():
                             except Exception as e_msg:
                                 logger.warning(f"[{client_name}] 获取群组 {chat_id} 最新消息时出错: {str(e_msg)}")
                             
-                            # 3. 清除未读消息标记（使用 read_chat_history）
+                            # 3. 直接模拟点击"Read All"：一次性清除所有未读消息和@标记
+                            # 使用 read_chat_history 不指定 max_id，会标记所有消息为已读（类似"Read All"功能）
                             try:
-                                if latest_message_id:
-                                    await client.read_chat_history(chat_id, max_id=latest_message_id)
-                                else:
-                                    await client.read_chat_history(chat_id)
+                                # 方法1：直接调用 read_chat_history 不指定 max_id，标记所有消息为已读
+                                await client.read_chat_history(chat_id)
+                                logger.debug(f"[{client_name}] 已调用 read_chat_history 标记群组 {chat_id} 所有消息为已读")
+                                
+                                # 方法2：如果是超级群组，调用 ReadMentions API 清除所有@标记
+                                try:
+                                    from pyrogram.raw.functions.messages import ReadMentions
+                                    from pyrogram.raw.types import InputPeerChannel
+                                    
+                                    peer = await client.resolve_peer(chat_id)
+                                    if isinstance(peer, InputPeerChannel):
+                                        # 调用 ReadMentions 不指定 top_msg_id，清除所有@标记
+                                        await client.invoke(ReadMentions(peer=peer, top_msg_id=None))
+                                        logger.debug(f"[{client_name}] 已调用 ReadMentions API 清除群组 {chat_id} 的所有@标记")
+                                    else:
+                                        # 普通群组，read_chat_history 应该已经清除了@标记
+                                        logger.debug(f"[{client_name}] 群组 {chat_id} 是普通群组，read_chat_history 已清除@标记")
+                                except Exception as e_mentions:
+                                    logger.debug(f"[{client_name}] 调用 ReadMentions API 时出错（不影响主流程）: {str(e_mentions)}")
+                                
                                 if unread_count > 0:
-                                    logger.info(f"[{client_name}] ✓ 已清除群组 {chat_id} 的未读消息标记（标记到消息ID: {latest_message_id or '最新'}，清除 {unread_count} 条未读）")
+                                    logger.info(f"[{client_name}] ✓ 已通过'Read All'方式清除群组 {chat_id} 的所有未读消息和@标记（清除 {unread_count} 条未读）")
                             except Exception as e_read:
-                                logger.warning(f"[{client_name}] 调用 read_chat_history 清除群组 {chat_id} 未读标记时出错: {str(e_read)}")
+                                logger.warning(f"[{client_name}] 调用'Read All'清除群组 {chat_id} 未读标记时出错: {str(e_read)}")
                             
-                            # 4. 直接模拟浏览群组信息来清除被@标记（不依赖 unread_mentions_count）
-                            # 对所有群组统一使用模拟浏览方法，更可靠
-                            try:
-                                max_msg_id = latest_message_id if latest_message_id else 0
-                                if max_msg_id > 0:
-                                    logger.debug(f"[{client_name}] 开始模拟浏览群组 {chat_id} 信息清除被@标记...")
+                            # 4. 验证清除结果：等待服务器处理
+                            if unread_count > 0:
+                                try:
+                                    # 等待服务器更新状态
+                                    await asyncio.sleep(1.0)  # 等待1秒，给服务器时间处理
+                                    logger.debug(f"[{client_name}] 已等待服务器处理群组 {chat_id} 的清除操作")
+                                except Exception as e_verify:
+                                    logger.debug(f"[{client_name}] 验证群组 {chat_id} 清除结果时出错: {str(e_verify)}")
+                            
+                            # 注意：如果"Read All"方式失败，可以启用下面的备用方法（模拟浏览）
+                            # 但通常不需要，因为 read_chat_history() 和 ReadMentions 已经足够
+                            use_fallback_browse = False  # 设置为 True 以启用备用浏览方法
+                            if use_fallback_browse:
+                                try:
+                                    max_msg_id = latest_message_id if latest_message_id else 0
+                                    if max_msg_id > 0:
+                                        logger.debug(f"[{client_name}] 开始模拟浏览群组 {chat_id} 信息清除被@标记（备用方法）...")
                                     
                                     # 1. 获取群组信息（模拟打开群组）
                                     try:
@@ -464,28 +492,11 @@ async def auto_mark_read_task():
                                     except Exception as e_read_mentions:
                                         logger.debug(f"[{client_name}] 调用 ReadMentions API 时出错（不影响主流程）: {str(e_read_mentions)}")
                                     
-                                    logger.info(f"[{client_name}] ✓ 已通过模拟浏览群组信息清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}，浏览了 {browse_count} 条消息，最新消息ID: {latest_message_id}）")
-                                else:
-                                    logger.debug(f"[{client_name}] 未找到最新消息ID，跳过清除被@标记")
-                            except Exception as e_mentions:
-                                logger.warning(f"[{client_name}] 模拟浏览群组 {chat_id} 信息清除被@标记时出错: {str(e_mentions)}")
-                                # 如果模拟浏览失败，尝试简单的标记方法
-                                try:
-                                    max_msg_id = latest_message_id if latest_message_id else 0
-                                    if max_msg_id > 0:
-                                        await client.read_chat_history(chat_id, max_id=max_msg_id)
-                                        logger.debug(f"[{client_name}] 已通过简单方法清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}）")
-                                except Exception as e_fallback:
-                                    logger.debug(f"[{client_name}] 备用方法也失败: {str(e_fallback)}")
-                            
-                            # 5. 验证清除结果：等待服务器处理（不检查 unread_mentions_count，因为它可能不准确）
-                            if unread_count > 0:
-                                try:
-                                    # 等待服务器更新状态（模拟浏览和 ReadMentions API 需要时间才能生效）
-                                    await asyncio.sleep(1.0)  # 等待1秒，给服务器时间处理
-                                    logger.debug(f"[{client_name}] 已等待服务器处理群组 {chat_id} 的清除操作")
-                                except Exception as e_verify:
-                                    logger.debug(f"[{client_name}] 验证群组 {chat_id} 清除结果时出错: {str(e_verify)}")
+                                        logger.info(f"[{client_name}] ✓ 已通过备用方法（模拟浏览）清除群组 {chat_id} 的被@标记（标记到消息ID: {max_msg_id}，浏览了 {browse_count} 条消息）")
+                                    else:
+                                        logger.debug(f"[{client_name}] 未找到最新消息ID，跳过备用方法")
+                                except Exception as e_mentions:
+                                    logger.warning(f"[{client_name}] 备用方法（模拟浏览）清除群组 {chat_id} 被@标记时出错: {str(e_mentions)}")
                             
                             # 添加延迟，避免触发限流
                             if mark_read_delay > 0:
