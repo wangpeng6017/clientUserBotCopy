@@ -337,6 +337,8 @@ async def auto_mark_read_task():
                                     
                                     # 增量浏览：从最新消息开始，获取从 min_last_id 到 max_browse_id 之间的消息
                                     # 使用 offset_id=0 从最新消息开始，然后过滤
+                                    # 模拟客户端慢慢滚动查看消息
+                                    
                                     async for message in client.get_chat_history(chat_id, limit=0, offset_id=0):
                                         if message:
                                             # 如果有上次浏览记录，只处理从上次最小ID开始的消息（增量浏览）
@@ -354,14 +356,29 @@ async def auto_mark_read_task():
                                             current_browse_ids.append(message.id)
                                             logger.debug(f"[{client_name}] 浏览消息ID {message.id}（第 {browse_count} 条）")
                                             
-                                            # 每浏览10条消息，标记一次为已读（模拟用户查看）
-                                            if browse_count % 10 == 0:
+                                            # 模拟用户慢慢滚动查看消息：每条消息后添加随机延迟
+                                            scroll_delay = random.uniform(operation_delay_min, operation_delay_max)
+                                            await asyncio.sleep(scroll_delay)
+                                            
+                                            # 每浏览5-10条消息，标记一次为已读（模拟用户停下来查看）
+                                            # 随机选择标记间隔，让行为更像真实用户
+                                            mark_interval = random.randint(5, 10)
+                                            if browse_count % mark_interval == 0:
                                                 try:
                                                     await client.read_chat_history(chat_id, max_id=message.id)
                                                     last_read_id = message.id
-                                                    await asyncio.sleep(0.1)  # 模拟用户查看消息的延迟
-                                                except Exception:
-                                                    pass
+                                                    # 标记为已读后，模拟用户停下来查看的延迟
+                                                    view_delay = random.uniform(0.5, 1.5)
+                                                    await asyncio.sleep(view_delay)
+                                                    logger.debug(f"[{client_name}] 已标记消息ID {message.id} 为已读（浏览了 {browse_count} 条）")
+                                                except Exception as e:
+                                                    logger.debug(f"[{client_name}] 标记消息为已读时出错: {str(e)}")
+                                            
+                                            # 随机添加"停下来仔细查看"的延迟（模拟用户对某些消息感兴趣）
+                                            if random.random() < 0.1:  # 10% 的概率
+                                                pause_delay = random.uniform(1.0, 3.0)
+                                                await asyncio.sleep(pause_delay)
+                                                logger.debug(f"[{client_name}] 模拟停下来仔细查看消息（暂停 {pause_delay:.2f} 秒）")
                                             
                                             # 如果设置了 max_browse_id 且已经到达，检查是否已经浏览了足够多的消息
                                             if max_browse_id and message.id >= max_browse_id:
@@ -387,12 +404,17 @@ async def auto_mark_read_task():
                                                     browse_count += 1
                                                     current_browse_ids.append(message.id)
                                                     logger.debug(f"[{client_name}] 备用方案浏览消息ID {message.id}（第 {browse_count} 条）")
-                                                    # 每浏览10条消息，标记一次为已读
-                                                    if browse_count % 10 == 0:
+                                                    # 模拟用户慢慢滚动查看消息
+                                                    scroll_delay = random.uniform(operation_delay_min, operation_delay_max)
+                                                    await asyncio.sleep(scroll_delay)
+                                                    # 每浏览5-10条消息，标记一次为已读
+                                                    mark_interval = random.randint(5, 10)
+                                                    if browse_count % mark_interval == 0:
                                                         try:
                                                             await client.read_chat_history(chat_id, max_id=message.id)
                                                             last_read_id = message.id
-                                                            await asyncio.sleep(0.1)
+                                                            view_delay = random.uniform(0.5, 1.5)
+                                                            await asyncio.sleep(view_delay)
                                                         except Exception:
                                                             pass
                                         except Exception as e_fallback:
