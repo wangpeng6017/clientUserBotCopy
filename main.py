@@ -136,22 +136,68 @@ else:
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), log_dir_config)
 
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f'client_tguserbot_{datetime.now().strftime("%Y%m%d")}.log')
+# 使用基础日志文件名（不包含日期，TimedRotatingFileHandler会自动添加日期后缀）
+log_file_base = os.path.join(log_dir, 'client_tguserbot.log')
 
 # 配置日志格式
 # 从环境变量或配置中读取日志级别，默认为 INFO
 log_level = config.get('log_level', 'INFO').upper()
-logging.basicConfig(
-    level=getattr(logging, log_level, logging.INFO),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(log_file, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
+
+# 使用 TimedRotatingFileHandler 实现按天自动轮转日志文件
+from logging.handlers import TimedRotatingFileHandler
+
+# 创建按天轮转的文件处理器（每天午夜轮转）
+file_handler = TimedRotatingFileHandler(
+    filename=log_file_base,
+    when='midnight',  # 每天午夜轮转
+    interval=1,  # 每1天
+    backupCount=0,  # 保留所有历史日志文件（不自动删除）
+    encoding='utf-8'
 )
 
+# 自定义文件名格式：将 client_tguserbot.log.YYYY-MM-DD 转换为 client_tguserbot_YYYYMMDD.log
+def namer(name):
+    """自定义日志文件名格式"""
+    # TimedRotatingFileHandler 默认格式是：client_tguserbot.log.YYYY-MM-DD
+    # 我们需要转换为：client_tguserbot_YYYYMMDD.log
+    base_name = os.path.basename(name)
+    dir_name = os.path.dirname(name)
+    
+    if '.' in base_name:
+        parts = base_name.split('.')
+        if len(parts) >= 3:
+            # 提取日期部分（最后一个部分，格式为 YYYY-MM-DD）
+            date_str = parts[-1]
+            # 转换为 YYYYMMDD 格式
+            date_formatted = date_str.replace('-', '')
+            # 返回新格式：client_tguserbot_YYYYMMDD.log
+            return os.path.join(dir_name, f'client_tguserbot_{date_formatted}.log')
+    
+    # 如果格式不符合预期，返回原文件名
+    return name
+
+file_handler.namer = namer
+
+# 创建控制台处理器
+console_handler = logging.StreamHandler(sys.stdout)
+
+# 设置日志格式
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# 配置根日志记录器
+root_logger = logging.getLogger()
+root_logger.setLevel(getattr(logging, log_level, logging.INFO))
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
+
+# 获取当前日志文件名（用于显示）
+# 使用当前日期生成日志文件名
+current_log_file = os.path.join(log_dir, f'client_tguserbot_{datetime.now().strftime("%Y%m%d")}.log')
+
 logger = logging.getLogger(__name__)
-logger.info(f"日志文件路径: {log_file}")
+logger.info(f"日志文件路径: {current_log_file}")
 logger.info(f"配置了 {len(accounts)} 个账户")
 logger.info(f"分配策略: {distribution_strategy}")
 
