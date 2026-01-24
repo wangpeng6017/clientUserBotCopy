@@ -652,32 +652,63 @@ async def message_sender():
             logger.info(f"使用客户端 {send_client_name} 发送消息到群组 {task.chat_id}（内容: {', '.join(content_desc) if content_desc else '空'}）")
             
             # ========== 模拟真人操作流程 ==========
+            # 获取队列大小，用于动态调整延迟
+            queue_size = message_queue.qsize()
+            
+            # 当队列数量很大时，动态减少延迟以加快发送速度
+            # 队列阈值：超过100条时开始加速
+            speed_up_threshold = 100
+            if queue_size > speed_up_threshold:
+                # 计算加速因子（队列越大，加速越多，但不会完全取消延迟）
+                # 当队列为100时，加速因子为1.0（不加速）
+                # 当队列为1000时，加速因子约为0.1（加速10倍）
+                speed_factor = max(0.1, 1.0 / (1.0 + (queue_size - speed_up_threshold) / 200.0))
+                logger.debug(f"🚀 队列较大（{queue_size}条），启用加速模式，加速因子: {speed_factor:.2f}")
+            else:
+                speed_factor = 1.0
+            
             # 1. 思考时间：模拟看到消息后的反应时间（使用正态分布，更自然）
-            think_time = max(think_time_min, min(think_time_max, 
-                random.gauss((think_time_min + think_time_max) / 2, (think_time_max - think_time_min) / 4)))
+            # 队列大时减少思考时间
+            adjusted_think_time_min = think_time_min * speed_factor
+            adjusted_think_time_max = think_time_max * speed_factor
+            think_time = max(adjusted_think_time_min, min(adjusted_think_time_max, 
+                random.gauss((adjusted_think_time_min + adjusted_think_time_max) / 2, 
+                           (adjusted_think_time_max - adjusted_think_time_min) / 4)))
             logger.debug(f"💭 模拟思考时间: {think_time:.2f} 秒...")
             await asyncio.sleep(think_time)
             
             # 2. 基础发送间隔 + 随机抖动（使用更不规律的分布）
             # 使用 Beta 分布，让延迟更集中在中间值，但偶尔会有较大波动
+            # 队列大时减少发送间隔
+            adjusted_send_interval = send_interval * speed_factor
+            adjusted_send_jitter = send_jitter * speed_factor
             beta_value = random.betavariate(2, 2)  # Beta(2,2) 分布，集中在中间
-            jitter = send_jitter * beta_value
-            base_delay = send_interval + jitter
+            jitter = adjusted_send_jitter * beta_value
+            base_delay = adjusted_send_interval + jitter
             
             # 3. 批量消息额外延迟：如果队列中有多条消息，增加延迟（模拟真人不会立即处理所有消息）
-            queue_size = message_queue.qsize()
-            batch_delay = queue_size * batch_delay_factor
+            # 队列大时，批量延迟设置上限，避免延迟过长
+            if queue_size > speed_up_threshold:
+                # 队列大时，批量延迟有上限（最多增加10秒）
+                max_batch_delay = 10.0
+                batch_delay = min(queue_size * batch_delay_factor * speed_factor, max_batch_delay)
+            else:
+                batch_delay = queue_size * batch_delay_factor
+            
             if queue_size > 0:
-                logger.debug(f"📦 队列中有 {queue_size} 条待处理消息，增加批量延迟: {batch_delay:.2f} 秒")
+                logger.debug(f"📦 队列中有 {queue_size} 条待处理消息，批量延迟: {batch_delay:.2f} 秒")
             
             total_delay = base_delay + batch_delay
-            logger.info(f"⏱️  等待 {total_delay:.2f} 秒后发送（基础间隔: {send_interval}秒，抖动: {jitter:.2f}秒，批量延迟: {batch_delay:.2f}秒）...")
+            logger.info(f"⏱️  等待 {total_delay:.2f} 秒后发送（基础间隔: {adjusted_send_interval:.2f}秒，抖动: {jitter:.2f}秒，批量延迟: {batch_delay:.2f}秒）...")
             
             # 等待延迟时间
             await asyncio.sleep(total_delay)
             
             # 4. 操作前延迟：模拟点击、选择等操作时间
-            operation_delay = random.uniform(operation_delay_min, operation_delay_max)
+            # 队列大时减少操作延迟
+            adjusted_operation_delay_min = operation_delay_min * speed_factor
+            adjusted_operation_delay_max = operation_delay_max * speed_factor
+            operation_delay = random.uniform(adjusted_operation_delay_min, adjusted_operation_delay_max)
             logger.debug(f"👆 模拟操作延迟: {operation_delay:.2f} 秒（点击、选择等）...")
             await asyncio.sleep(operation_delay)
             
